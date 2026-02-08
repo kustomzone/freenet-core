@@ -24,6 +24,53 @@ pub(crate) struct TransientEntry {
 /// to prevent permanent node isolation when CONNECT operations fail to complete.
 const PENDING_RESERVATION_TTL: Duration = Duration::from_secs(60);
 
+/// Maximum number of concurrent CONNECT operations a gateway will route simultaneously.
+/// This prevents thundering-herd scenarios where many joiners hit the same gateway at once.
+/// The value 8 balances throughput (parallel joins) against overload protection. Non-gateways
+/// use `usize::MAX` since they see far fewer concurrent connects.
+const MAX_CONCURRENT_GATEWAY_CONNECTS: usize = 8;
+
+/// RAII guard that releases a connect admission slot when dropped.
+///
+/// This ensures the slot is always released, even when `?` operators cause early returns
+/// from error paths. Without this guard, transient errors between `try_admit_connect()`
+/// and the manual `release_connect()` call would permanently leak slots, eventually
+/// bricking the gateway (with only 8 slots available).
+pub(crate) struct ConnectAdmissionGuard {
+    connect_in_flight: Arc<AtomicUsize>,
+    released: bool,
+}
+
+impl ConnectAdmissionGuard {
+    fn new(connect_in_flight: Arc<AtomicUsize>) -> Self {
+        Self {
+            connect_in_flight,
+            released: false,
+        }
+    }
+
+    /// Explicitly release the slot (e.g., when forwarding to the next hop).
+    /// After calling this, the Drop impl is a no-op.
+    #[cfg(test)]
+    pub fn release(mut self) {
+        if !self.released {
+            self.released = true;
+            let prev = self.connect_in_flight.fetch_sub(1, Ordering::SeqCst);
+            debug_assert!(prev > 0, "connect_in_flight underflow on explicit release");
+        }
+    }
+}
+
+impl Drop for ConnectAdmissionGuard {
+    fn drop(&mut self) {
+        if !self.released {
+            self.released = true;
+            let prev = self.connect_in_flight.fetch_sub(1, Ordering::SeqCst);
+            debug_assert!(prev > 0, "connect_in_flight underflow on drop");
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ConnectionManager {
     /// Pending connection reservations, keyed by socket address.
@@ -49,6 +96,11 @@ pub(crate) struct ConnectionManager {
     pub max_connections: usize,
     pub rnd_if_htl_above: usize,
     pub pub_key: Arc<TransportPublicKey>,
+    /// Number of CONNECT operations currently being routed through this node.
+    connect_in_flight: Arc<AtomicUsize>,
+    /// Maximum concurrent CONNECT operations this node will route.
+    /// Gateways use a bounded value; non-gateways use usize::MAX (unlimited).
+    max_concurrent_connects: usize,
 }
 
 impl ConnectionManager {
@@ -150,6 +202,33 @@ impl ConnectionManager {
             max_connections,
             rnd_if_htl_above,
             pub_key: Arc::new(pub_key),
+            connect_in_flight: Arc::new(AtomicUsize::new(0)),
+            max_concurrent_connects: if is_gateway {
+                MAX_CONCURRENT_GATEWAY_CONNECTS
+            } else {
+                usize::MAX
+            },
+        }
+    }
+
+    /// Try to admit a new connect operation for routing.
+    /// Returns `None` if the node is at capacity for concurrent connects.
+    /// Returns `Some(ConnectAdmissionGuard)` on success — the slot is automatically
+    /// released when the guard is dropped, preventing leaks on error paths.
+    #[must_use]
+    pub fn try_admit_connect(&self) -> Option<ConnectAdmissionGuard> {
+        loop {
+            let current = self.connect_in_flight.load(Ordering::Acquire);
+            if current >= self.max_concurrent_connects {
+                return None;
+            }
+            if self
+                .connect_in_flight
+                .compare_exchange_weak(current, current + 1, Ordering::SeqCst, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Some(ConnectAdmissionGuard::new(self.connect_in_flight.clone()));
+            }
         }
     }
 
@@ -1701,5 +1780,81 @@ mod tests {
         assert_eq!(cm.get_reserved_connections(), 1);
         assert!(!cm.has_connection_or_pending(addr1));
         assert!(cm.has_connection_or_pending(addr2));
+    }
+
+    // ============ Admission control tests ============
+
+    #[test]
+    fn test_admission_control_gateway_limit() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 5, 20, true);
+
+        // Gateway should have max_concurrent_connects = MAX_CONCURRENT_GATEWAY_CONNECTS
+        let mut guards = Vec::new();
+        for _ in 0..MAX_CONCURRENT_GATEWAY_CONNECTS {
+            let guard = cm.try_admit_connect();
+            assert!(guard.is_some(), "should admit within limit");
+            guards.push(guard.unwrap());
+        }
+        assert!(
+            cm.try_admit_connect().is_none(),
+            "should reject when at capacity"
+        );
+    }
+
+    #[test]
+    fn test_admission_control_release_frees_slot() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 5, 20, true);
+
+        // Fill up all slots
+        let mut guards = Vec::new();
+        for _ in 0..MAX_CONCURRENT_GATEWAY_CONNECTS {
+            guards.push(cm.try_admit_connect().unwrap());
+        }
+        assert!(cm.try_admit_connect().is_none());
+
+        // Release one slot by dropping the guard
+        guards.pop();
+        assert!(
+            cm.try_admit_connect().is_some(),
+            "should admit after release"
+        );
+    }
+
+    #[test]
+    fn test_admission_control_non_gateway_unlimited() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 5, 20, false);
+
+        // Non-gateway should have unlimited admission — hold guards to keep slots occupied
+        let guards: Vec<_> = (0..100)
+            .map(|_| {
+                cm.try_admit_connect()
+                    .expect("non-gateway should always admit")
+            })
+            .collect();
+        assert_eq!(guards.len(), 100);
+    }
+
+    #[test]
+    fn test_admission_guard_explicit_release() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 5, 20, true);
+
+        let guard = cm.try_admit_connect().unwrap();
+        assert_eq!(cm.connect_in_flight.load(Ordering::SeqCst), 1);
+
+        // Explicit release
+        guard.release();
+        assert_eq!(cm.connect_in_flight.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn test_admission_guard_drop_release() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 5, 20, true);
+
+        {
+            let _guard = cm.try_admit_connect().unwrap();
+            assert_eq!(cm.connect_in_flight.load(Ordering::SeqCst), 1);
+        }
+        // Guard dropped, slot should be released
+        assert_eq!(cm.connect_in_flight.load(Ordering::SeqCst), 0);
     }
 }
