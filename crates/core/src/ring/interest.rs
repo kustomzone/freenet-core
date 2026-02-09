@@ -825,6 +825,10 @@ impl<T: TimeSource> InterestManager<T> {
     /// `get_state_delta` method. Results are cached to avoid recomputation
     /// for peers with the same summary.
     ///
+    /// Returns `Ok(None)` when the contract returns an empty delta (zero bytes),
+    /// meaning the peer's state is logically equivalent to ours despite differing
+    /// summary bytes (e.g., due to non-deterministic serialization order).
+    ///
     /// # Arguments
     /// * `our_summary` - Our current state summary (used for cache key)
     /// * `our_state_size` - Size of our current state (for efficiency check)
@@ -835,7 +839,7 @@ impl<T: TimeSource> InterestManager<T> {
         their_summary: &StateSummary<'static>,
         our_summary: &StateSummary<'static>,
         our_state_size: usize,
-    ) -> Result<StateDelta<'static>, String> {
+    ) -> Result<Option<StateDelta<'static>>, String> {
         use crate::contract::ContractHandlerEvent;
 
         // Use slices directly - cache methods hash internally, no allocation needed
@@ -844,11 +848,12 @@ impl<T: TimeSource> InterestManager<T> {
 
         // Check cache first (keyed by hash of contract + summaries)
         if let Some(cached) = self.get_cached_delta(key, their_summary_bytes, our_summary_bytes) {
-            tracing::trace!(
-                contract = %key,
-                "Using cached delta"
-            );
-            return Ok(cached);
+            if cached.as_ref().is_empty() {
+                tracing::trace!(contract = %key, "Cached empty delta (no change)");
+                return Ok(None);
+            }
+            tracing::trace!(contract = %key, "Using cached delta");
+            return Ok(Some(cached));
         }
 
         // Check if delta would be efficient
@@ -866,9 +871,20 @@ impl<T: TimeSource> InterestManager<T> {
             .await
         {
             Ok(ContractHandlerEvent::GetDeltaResponse { delta: Ok(d), .. }) => {
-                // Cache the result (includes contract key to prevent cross-contract pollution)
-                self.cache_delta(key, their_summary_bytes, our_summary_bytes, d.clone());
-                Ok(d)
+                if d.as_ref().is_empty() {
+                    // Empty delta means no change needed — cache it so we don't
+                    // re-invoke the contract on subsequent broadcast cycles
+                    self.cache_delta(key, their_summary_bytes, our_summary_bytes, d);
+                    tracing::trace!(
+                        contract = %key,
+                        "Contract returned empty delta (no change)"
+                    );
+                    Ok(None)
+                } else {
+                    // Cache the result (includes contract key to prevent cross-contract pollution)
+                    self.cache_delta(key, their_summary_bytes, our_summary_bytes, d.clone());
+                    Ok(Some(d))
+                }
             }
             Ok(ContractHandlerEvent::GetDeltaResponse { delta: Err(e), .. }) => {
                 Err(format!("Delta computation failed: {}", e))

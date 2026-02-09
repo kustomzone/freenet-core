@@ -1879,7 +1879,20 @@ impl P2pConnManager {
                                                 )
                                                 .await
                                             {
-                                                Ok(delta) => (
+                                                Ok(None) => {
+                                                    // Empty delta — no change needed for this peer.
+                                                    // Update their cached summary so we don't
+                                                    // re-check this pair every broadcast cycle.
+                                                    op_manager
+                                                        .interest_manager
+                                                        .update_peer_summary(
+                                                            &key,
+                                                            &peer_key,
+                                                            Some(ours.clone()),
+                                                        );
+                                                    continue;
+                                                }
+                                                Ok(Some(delta)) => (
                                                     crate::message::DeltaOrFullState::Delta(
                                                         delta.as_ref().to_vec(),
                                                     ),
