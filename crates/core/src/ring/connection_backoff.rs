@@ -231,6 +231,12 @@ impl ConnectionBackoff {
         self.inner.cleanup_expired();
     }
 
+    /// Clear all backoff state. Used during isolation recovery when the node
+    /// has had zero connections for too long and needs to retry aggressively.
+    pub fn clear(&mut self) {
+        self.inner.clear();
+    }
+
     /// Get the failure count for a location (for testing).
     #[cfg(test)]
     fn failure_count(&self, target: Location) -> u32 {
@@ -460,5 +466,24 @@ mod tests {
         // Success should clear it regardless of reason
         backoff.record_success(loc);
         assert!(!backoff.is_in_backoff(loc));
+    }
+
+    #[test]
+    fn test_clear_removes_all_backoff_state() {
+        let mut backoff =
+            ConnectionBackoff::with_config(Duration::from_secs(1), Duration::from_secs(300), 256);
+
+        let loc1 = Location::new(0.3);
+        let loc2 = Location::new(0.7);
+
+        backoff.record_failure(loc1);
+        backoff.record_failure(loc2);
+        assert!(backoff.is_in_backoff(loc1));
+        assert!(backoff.is_in_backoff(loc2));
+
+        backoff.clear();
+        assert!(!backoff.is_in_backoff(loc1));
+        assert!(!backoff.is_in_backoff(loc2));
+        assert_eq!(backoff.inner.len(), 0);
     }
 }
