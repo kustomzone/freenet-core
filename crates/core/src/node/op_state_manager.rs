@@ -9,6 +9,7 @@
 use std::{
     cmp::Reverse,
     collections::{BTreeSet, HashSet},
+    net::SocketAddr,
     sync::{atomic::AtomicBool, Arc, OnceLock},
     time::Duration,
 };
@@ -24,15 +25,19 @@ use crate::{
     client_events::HostResult,
     config::GlobalExecutor,
     contract::{ContractError, ContractHandlerChannel, ContractHandlerEvent, SenderHalve},
-    message::{MessageStats, NetMessage, NodeEvent, Transaction, TransactionType},
+    message::{
+        InterestMessage, MessageStats, NetMessage, NetMessageV1, NodeEvent, Transaction,
+        TransactionType,
+    },
     operations::{
         connect::ConnectForwardEstimator, get::GetOp, orphan_streams::OrphanStreamRegistry,
         put::PutOp, subscribe::SubscribeOp, update::UpdateOp, OpEnum, OpError,
     },
     ring::{
         ConnectionFailureReason, ConnectionManager, LiveTransactionTracker, PeerConnectionBackoff,
-        PeerKeyLocation, Ring,
+        PeerKey, PeerKeyLocation, Ring,
     },
+    transport::TransportPublicKey,
     util::time_source::InstantTimeSrc,
 };
 
@@ -507,26 +512,6 @@ impl OpManager {
             .map_err(Into::into)
     }
 
-    /// Non-blocking version of notify_node_event.
-    ///
-    /// Use this when the notification is best-effort and blocking would be harmful
-    /// (e.g., in the client event handling loop where blocking would freeze all
-    /// HTTP/WebSocket processing).
-    ///
-    /// Returns Ok(()) if the message was sent, Err if the channel is full or closed.
-    pub fn try_notify_node_event(&self, msg: NodeEvent) -> Result<(), OpError> {
-        tracing::debug!(event = %msg, "try_notify_node_event: attempting to queue node event");
-        self.to_event_listener
-            .notifications_sender
-            .try_send(Either::Right(msg))
-            .map_err(|err| {
-                OpError::NotificationChannelError(format!(
-                    "Failed to send node event (channel full or closed): {}",
-                    err
-                ))
-            })
-    }
-
     /// Get all active subscriptions.
     /// In the simplified lease-based model, this returns contracts we're actively subscribed to.
     /// Note: We no longer track per-contract subscriber lists.
@@ -912,6 +897,44 @@ impl OpManager {
     #[allow(dead_code)] // Phase 3 infrastructure - will be used when streaming handlers are implemented
     pub fn should_use_streaming(&self, payload_size: usize) -> bool {
         self.streaming_enabled && payload_size > self.streaming_threshold
+    }
+
+    /// Builds the messages we need to send to a peer that just joined the ring,
+    /// so it learns which contracts we're subscribed to and our cached state.
+    pub(crate) fn on_ring_connection_established(
+        &self,
+        peer_addr: SocketAddr,
+        pub_key: &TransportPublicKey,
+    ) -> Vec<(SocketAddr, NetMessage)> {
+        let mut messages = Vec::with_capacity(2);
+
+        let interest_hashes = self.interest_manager.get_all_interest_hashes();
+        if !interest_hashes.is_empty() {
+            messages.push((
+                peer_addr,
+                NetMessage::V1(NetMessageV1::InterestSync {
+                    message: InterestMessage::Interests {
+                        hashes: interest_hashes,
+                    },
+                }),
+            ));
+        }
+
+        if let Some(cache_msg) = self.proximity_cache.on_ring_connection_established(pub_key) {
+            messages.push((
+                peer_addr,
+                NetMessage::V1(NetMessageV1::ProximityCache { message: cache_msg }),
+            ));
+        }
+
+        messages
+    }
+
+    /// Removes all tracked state for a peer that left the ring.
+    pub(crate) fn on_ring_connection_lost(&self, pub_key: &TransportPublicKey) {
+        self.proximity_cache.on_peer_disconnected(pub_key);
+        self.interest_manager
+            .remove_all_peer_interests(&PeerKey::from(pub_key.clone()));
     }
 }
 
