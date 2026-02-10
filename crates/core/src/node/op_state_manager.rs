@@ -506,6 +506,8 @@ impl OpManager {
                 tracing::error!(
                     tx = %tx,
                     timeout_secs = Self::NOTIFICATION_SEND_TIMEOUT.as_secs(),
+                    channel_pending = self.to_event_listener.notification_channel_pending(),
+                    channel_remaining = self.to_event_listener.notifications_sender().capacity(),
                     "notify_op_change: Notification channel full for too long, event loop may be stuck"
                 );
                 return Err(OpError::NotificationChannelError(
@@ -543,6 +545,8 @@ impl OpManager {
             Err(_) => {
                 tracing::error!(
                     timeout_secs = Self::NOTIFICATION_SEND_TIMEOUT.as_secs(),
+                    channel_pending = self.to_event_listener.notification_channel_pending(),
+                    channel_remaining = self.to_event_listener.notifications_sender().capacity(),
                     "notify_node_event: Notification channel full for too long, event loop may be stuck"
                 );
                 Err(OpError::NotificationChannelError(
@@ -994,21 +998,33 @@ impl OpManager {
     }
 }
 
-async fn notify_transaction_timeout(
+/// Notify the event loop about a timed-out transaction without blocking.
+///
+/// Uses `try_send` instead of `.send().await` to avoid blocking the garbage
+/// cleanup task when the notification channel is full. The GC task already
+/// cleans up the transaction from the ops maps — this notification only
+/// lets the event loop clean up its `tx_to_client` map, so dropping it
+/// when the channel is congested is acceptable.
+fn notify_transaction_timeout(
     event_loop_notifier: &EventLoopNotificationsSender,
     tx: Transaction,
 ) -> bool {
     match event_loop_notifier
         .notifications_sender
-        .send(Either::Right(NodeEvent::TransactionTimedOut(tx)))
-        .await
+        .try_send(Either::Right(NodeEvent::TransactionTimedOut(tx)))
     {
         Ok(()) => true,
-        Err(err) => {
+        Err(mpsc::error::TrySendError::Full(_)) => {
             tracing::warn!(
                 tx = %tx,
-                error = ?err,
-                "Failed to notify event loop about timed out transaction; receiver likely dropped"
+                "Notification channel full, skipping timeout notification for event loop"
+            );
+            false
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            tracing::warn!(
+                tx = %tx,
+                "Notification channel closed, receiver likely dropped"
             );
             false
         }
@@ -1175,7 +1191,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                             let _ = result_router_tx.send((parent_tx, error_result)).await;
                         }
 
-                        notify_transaction_timeout(&event_loop_notifier, tx).await;
+                        notify_transaction_timeout(&event_loop_notifier, tx);
                         live_tx_tracker.remove_finished_transaction(tx);
 
                         // Clean up request router to prevent stale entries from blocking
@@ -1251,7 +1267,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                             let _ = result_router_tx.send((parent_tx, error_result)).await;
                         }
 
-                        notify_transaction_timeout(&event_loop_notifier, tx).await;
+                        notify_transaction_timeout(&event_loop_notifier, tx);
                         live_tx_tracker.remove_finished_transaction(tx);
 
                         // Clean up request router to prevent stale entries from blocking
@@ -1284,7 +1300,7 @@ mod tests {
 
         let tx = Transaction::ttl_transaction();
 
-        let delivered = notify_transaction_timeout(&notifier, tx).await;
+        let delivered = notify_transaction_timeout(&notifier, tx);
         assert!(
             delivered,
             "notification should be delivered while receiver is alive"
@@ -1310,7 +1326,7 @@ mod tests {
 
         let tx = Transaction::ttl_transaction();
 
-        let delivered = notify_transaction_timeout(&notifier, tx).await;
+        let delivered = notify_transaction_timeout(&notifier, tx);
         assert!(
             !delivered,
             "notification delivery should fail once receiver is dropped"
