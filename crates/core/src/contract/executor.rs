@@ -684,6 +684,11 @@ pub(crate) trait ContractExecutor: Send + 'static {
     /// Notify all subscribed clients for a contract that the subscription has failed.
     fn notify_subscription_error(&self, key: ContractInstanceId, reason: String);
 
+    /// Remove all subscriptions for a disconnected client.
+    ///
+    /// Default implementation is a no-op (for mock executors that don't track subscriptions).
+    fn remove_client(&self, _client_id: ClientId) {}
+
     /// Compute the state summary for a contract using the contract's summarize_state method.
     fn summarize_contract_state(
         &mut self,

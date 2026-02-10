@@ -326,8 +326,10 @@ impl Runtime {
         // Check shared cache first (lock held briefly for Arc clone)
         let cached = self.contract_modules.lock().unwrap().get(key).cloned();
         let module = if let Some(module) = cached {
+            tracing::debug!(contract = %key, "Module cache hit");
             module
         } else {
+            tracing::info!(contract = %key, "Module cache miss — compiling");
             // Cache miss — compile outside the lock to avoid blocking other executors
             let contract = self
                 .contract_store
@@ -386,8 +388,10 @@ impl Runtime {
     ) -> RuntimeResult<(RunningInstance, DelegateApiVersion)> {
         let cached = self.delegate_modules.lock().unwrap().get(key).cloned();
         let module = if let Some(module) = cached {
+            tracing::debug!(delegate = %key, "Module cache hit");
             module
         } else {
+            tracing::info!(delegate = %key, "Module cache miss — compiling");
             let delegate = self
                 .delegate_store
                 .fetch_delegate(key, params)
