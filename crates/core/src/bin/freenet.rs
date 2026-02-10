@@ -1,4 +1,4 @@
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
