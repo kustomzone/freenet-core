@@ -3299,9 +3299,9 @@ pub mod tracer {
     use tracing_appender::rolling::{RollingFileAppender, Rotation};
     use tracing_subscriber::{Layer, Registry};
 
-    /// Number of hours to keep log files (using hourly rotation)
-    /// Keeps logs small to prevent disk fill-up from log spam
-    const LOG_RETENTION_HOURS: usize = 3;
+    /// Number of hours to keep log files (using hourly rotation).
+    /// At typical gateway log rates (~500KB/hour), 72 hours ≈ 36MB.
+    const LOG_RETENTION_HOURS: usize = 72;
 
     /// Guards for non-blocking file appenders - must be kept alive for the lifetime of the program
     static LOG_GUARDS: OnceLock<Vec<WorkerGuard>> = OnceLock::new();
@@ -3461,7 +3461,7 @@ pub mod tracer {
                 // Clean up old log files (including legacy daily logs) on startup
                 cleanup_old_logs(log_dir);
 
-                // Create rolling file appender for main log (hourly rotation, 3 hour retention)
+                // Create rolling file appender for main log (hourly rotation)
                 let main_appender = RollingFileAppender::builder()
                     .rotation(Rotation::HOURLY)
                     .max_log_files(LOG_RETENTION_HOURS)
@@ -3470,7 +3470,7 @@ pub mod tracer {
                     .build(log_dir)
                     .map_err(|e| anyhow::anyhow!("Failed to create log appender: {e}"))?;
 
-                // Create rolling file appender for error log (hourly rotation, 3 hour retention)
+                // Create rolling file appender for error log (hourly rotation)
                 let error_appender = RollingFileAppender::builder()
                     .rotation(Rotation::HOURLY)
                     .max_log_files(LOG_RETENTION_HOURS)
