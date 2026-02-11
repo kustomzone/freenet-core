@@ -150,9 +150,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use wasmtime::{
-    Caller, Config, Engine, Error as WasmtimeError, Extern, Func, Instance,
-    InstanceAllocationStrategy, Linker, Module, OptLevel, PoolingAllocationConfig, ResourceLimiter,
-    Store, TypedFunc,
+    Caller, Config, Engine, Error as WasmtimeError, Instance, InstanceAllocationStrategy, Linker,
+    Module, OptLevel, PoolingAllocationConfig, ResourceLimiter, Store,
 };
 
 use super::{InstanceHandle, WasmEngine, WasmError};
@@ -311,29 +310,20 @@ impl WasmEngine for WasmtimeEngine {
             .map_err(|e| WasmError::Instantiation(e.to_string()))?;
 
         // Call __frnt_set_id to set the instance ID (used for MEM_ADDR lookup)
+        // CRITICAL: Must use call_async() because async_support(true) is enabled
         if let Some(set_id_func) = instance.get_func(&mut *store, "__frnt_set_id") {
             let typed_func = set_id_func
                 .typed::<i64, ()>(&*store)
                 .map_err(|e| WasmError::Export(e.to_string()))?;
-            typed_func
-                .call(&mut *store, id)
+            block_on_async(typed_func.call_async(&mut *store, id))
                 .map_err(|e| WasmError::Runtime(e.to_string()))?;
         }
 
-        // Record memory address for host function pointer arithmetic
-        let memory = instance
-            .get_memory(&mut *store, "memory")
-            .ok_or_else(|| WasmError::Export("memory export not found".to_string()))?;
-        let data = memory.data(&*store);
-        native_api::MEM_ADDR.insert(
-            id,
-            crate::wasm_runtime::runtime::InstanceInfo {
-                start_ptr: data.as_ptr() as i64,
-                key: crate::wasm_runtime::runtime::Key::Contract(
-                    freenet_stdlib::prelude::ContractInstanceId::default(),
-                ),
-            },
-        );
+        // Note: MEM_ADDR insertion is handled by RunningInstance::new in runtime.rs
+        // which has the correct contract key. Do NOT insert here with a default key.
+
+        // Ensure sufficient memory for the request
+        Self::ensure_memory(store, &instance, req_bytes)?;
 
         self.instances.insert(id, instance);
 
@@ -373,7 +363,8 @@ impl WasmEngine for WasmtimeEngine {
         let func = instance
             .get_typed_func::<u32, i64>(&mut *store, "__frnt__initiate_buffer")
             .map_err(|e| WasmError::Export(e.to_string()))?;
-        func.call(&mut *store, size)
+        // CRITICAL: Must use call_async() because async_support(true) is enabled
+        block_on_async(func.call_async(&mut *store, size))
             .map_err(|e| WasmError::Runtime(e.to_string()))
     }
 
@@ -604,7 +595,12 @@ impl WasmtimeEngine {
         }
 
         if host_mem {
-            tracing::warn!("host_mem=true not fully supported in wasmtime backend yet");
+            return Err(anyhow::anyhow!(
+                "host_mem=true is not supported in wasmtime backend. \
+                 Host-managed memory requires direct memory manipulation which is \
+                 incompatible with wasmtime's sandboxed memory model."
+            )
+            .into());
         }
 
         Ok(Self {
@@ -631,7 +627,9 @@ impl WasmtimeEngine {
         wasmtime_config.async_support(true);
 
         // Set memory limits via config
-        wasmtime_config.max_wasm_stack(8 * 1024 * 1024); // 8 MiB stack
+        // async_stack_size must exceed max_wasm_stack when async_support is enabled
+        wasmtime_config.max_wasm_stack(WASM_STACK_SIZE);
+        wasmtime_config.async_stack_size(WASM_STACK_SIZE * 2);
 
         // ==================================================================
         // MEMORY MANAGEMENT OPTIMIZATIONS (#2941, #2942, #2928)
@@ -667,10 +665,10 @@ impl WasmtimeEngine {
 
         wasmtime_config.allocation_strategy(InstanceAllocationStrategy::Pooling(pooling));
 
-        // Enable Cranelift optimizations for compact machine code
-        // SpeedAndSize balances performance with memory footprint.
-        // Expected to generate significantly more compact code than wasmer's ~10 MB per contract.
-        wasmtime_config.cranelift_opt_level(OptLevel::SpeedAndSize);
+        // Use OptLevel::None for maximum security with untrusted code
+        // Simpler compiler = smaller attack surface
+        // Memory benefits come from pooling and proper cleanup, not optimizations
+        wasmtime_config.cranelift_opt_level(OptLevel::None);
 
         let engine = Engine::new(&wasmtime_config).map_err(|e| WasmError::Other(e.into()))?;
 
@@ -698,6 +696,38 @@ impl WasmtimeEngine {
         (config.max_execution_seconds * cpu_cycles_per_sec as f64 * (1.0 + safety_margin)) as u64
     }
 
+    /// Ensure WASM linear memory has sufficient pages for the request.
+    ///
+    /// If the instance's memory is smaller than required, this will attempt to grow it.
+    /// This prevents cryptic memory traps when contracts request more memory than initially allocated.
+    fn ensure_memory(
+        store: &mut Store<HostState>,
+        instance: &Instance,
+        req_bytes: usize,
+    ) -> Result<(), WasmError> {
+        const WASM_PAGE_SIZE: usize = 65536; // 64 KB
+
+        let memory = instance
+            .get_memory(&mut *store, "memory")
+            .ok_or_else(|| WasmError::Export("memory export not found".to_string()))?;
+
+        let current_bytes = memory.data_size(&*store);
+        if current_bytes < req_bytes {
+            let current_pages = (current_bytes + WASM_PAGE_SIZE - 1) / WASM_PAGE_SIZE;
+            let required_pages = (req_bytes + WASM_PAGE_SIZE - 1) / WASM_PAGE_SIZE;
+            let pages_to_grow = required_pages.saturating_sub(current_pages) as u64;
+
+            if let Err(err) = memory.grow(&mut *store, pages_to_grow) {
+                tracing::error!("WASM runtime failed with memory error: {err}");
+                return Err(WasmError::Memory(format!(
+                    "insufficient memory: requested {} bytes ({} pages) but had {} bytes ({} pages)",
+                    req_bytes, required_pages, current_bytes, current_pages
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn register_host_functions(linker: &mut Linker<HostState>) -> Result<(), ContractError> {
         // Log namespace
         linker
@@ -707,8 +737,8 @@ impl WasmtimeEngine {
         // Rand namespace
         linker
             .func_wrap(
-                "freenet_random",
-                "__frnt__random_bytes",
+                "freenet_rand",
+                "__frnt__rand__rand_bytes",
                 native_api::rand::rand_bytes,
             )
             .map_err(|e| WasmError::Other(e.into()))?;
@@ -725,24 +755,24 @@ impl WasmtimeEngine {
         // Delegate context namespace (synchronous)
         linker
             .func_wrap(
-                "freenet_delegate_context",
-                "__frnt__context__len",
+                "freenet_delegate_ctx",
+                "__frnt__delegate__ctx_len",
                 native_api::delegate_context::context_len,
             )
             .map_err(|e| WasmError::Other(e.into()))?;
 
         linker
             .func_wrap(
-                "freenet_delegate_context",
-                "__frnt__context__read",
+                "freenet_delegate_ctx",
+                "__frnt__delegate__ctx_read",
                 native_api::delegate_context::context_read,
             )
             .map_err(|e| WasmError::Other(e.into()))?;
 
         linker
             .func_wrap(
-                "freenet_delegate_context",
-                "__frnt__context__write",
+                "freenet_delegate_ctx",
+                "__frnt__delegate__ctx_write",
                 native_api::delegate_context::context_write,
             )
             .map_err(|e| WasmError::Other(e.into()))?;
@@ -751,7 +781,7 @@ impl WasmtimeEngine {
         linker
             .func_wrap(
                 "freenet_delegate_secrets",
-                "__frnt__secrets__get",
+                "__frnt__delegate__get_secret",
                 native_api::delegate_secrets::get_secret,
             )
             .map_err(|e| WasmError::Other(e.into()))?;
@@ -759,7 +789,7 @@ impl WasmtimeEngine {
         linker
             .func_wrap(
                 "freenet_delegate_secrets",
-                "__frnt__secrets__get_len",
+                "__frnt__delegate__get_secret_len",
                 native_api::delegate_secrets::get_secret_len,
             )
             .map_err(|e| WasmError::Other(e.into()))?;
@@ -767,7 +797,7 @@ impl WasmtimeEngine {
         linker
             .func_wrap(
                 "freenet_delegate_secrets",
-                "__frnt__secrets__set",
+                "__frnt__delegate__set_secret",
                 native_api::delegate_secrets::set_secret,
             )
             .map_err(|e| WasmError::Other(e.into()))?;
@@ -775,7 +805,7 @@ impl WasmtimeEngine {
         linker
             .func_wrap(
                 "freenet_delegate_secrets",
-                "__frnt__secrets__has",
+                "__frnt__delegate__has_secret",
                 native_api::delegate_secrets::has_secret,
             )
             .map_err(|e| WasmError::Other(e.into()))?;
@@ -783,7 +813,7 @@ impl WasmtimeEngine {
         linker
             .func_wrap(
                 "freenet_delegate_secrets",
-                "__frnt__secrets__remove",
+                "__frnt__delegate__remove_secret",
                 native_api::delegate_secrets::remove_secret,
             )
             .map_err(|e| WasmError::Other(e.into()))?;
@@ -1019,12 +1049,13 @@ mod tests {
         let (engine, _, _) = WasmtimeEngine::create_engine(&config).unwrap();
 
         // Compile and instantiate multiple times - pooling should reuse memory
+        // Must use instantiate_async + block_on_async because async_support is enabled
         for _ in 0..5 {
             let module = Module::new(&engine, SIMPLE_WASM).unwrap();
             let mut store = Store::new(&engine, HostState::new(DEFAULT_MAX_MEMORY_PAGES));
-            let mut linker = Linker::new(&engine);
+            let linker = Linker::new(&engine);
 
-            let instance = linker.instantiate(&mut store, &module);
+            let instance = block_on_async(linker.instantiate_async(&mut store, &module));
             assert!(
                 instance.is_ok(),
                 "Instance creation should succeed with pooling"
@@ -1044,6 +1075,126 @@ mod tests {
         // We can't easily measure the exact size without internals access,
         // but we verify it compiles successfully.
         assert!(module.exports().count() > 0, "Module should have exports");
+    }
+
+    /// Verify that host function namespaces and names match what freenet-stdlib
+    /// imports. This is a critical ABI contract test — if any name is wrong,
+    /// ALL WASM modules will fail to instantiate with import resolution errors.
+    ///
+    /// The WAT module imports one function from each namespace to validate the
+    /// registration. If register_host_functions changes a namespace or name,
+    /// this test will fail at instantiation time.
+    #[test]
+    fn test_host_function_abi_compatibility() {
+        // WAT module that imports one function per host namespace.
+        // Signatures must match the Rust host function types exactly.
+        // Rust type mapping: i32/u32 → wasm i32, i64 → wasm i64
+        let wat = r#"
+        (module
+          ;; log::info(id: i64, ptr: i64, len: i32)
+          (import "freenet_log" "__frnt__logger__info"
+            (func $log (param i64 i64 i32)))
+          ;; rand::rand_bytes(id: i64, ptr: i64, len: u32)
+          (import "freenet_rand" "__frnt__rand__rand_bytes"
+            (func $rand (param i64 i64 i32)))
+          ;; time::utc_now(id: i64, ptr: i64)
+          (import "freenet_time" "__frnt__time__utc_now"
+            (func $time (param i64 i64)))
+          ;; context_len() -> i32
+          (import "freenet_delegate_ctx" "__frnt__delegate__ctx_len"
+            (func $ctx_len (result i32)))
+          ;; context_read(ptr: i64, len: i32) -> i32
+          (import "freenet_delegate_ctx" "__frnt__delegate__ctx_read"
+            (func $ctx_read (param i64 i32) (result i32)))
+          ;; context_write(ptr: i64, len: i32) -> i32
+          (import "freenet_delegate_ctx" "__frnt__delegate__ctx_write"
+            (func $ctx_write (param i64 i32) (result i32)))
+          ;; get_secret(key_ptr: i64, key_len: i32, out_ptr: i64, out_len: i32) -> i32
+          (import "freenet_delegate_secrets" "__frnt__delegate__get_secret"
+            (func $get_secret (param i64 i32 i64 i32) (result i32)))
+          ;; get_secret_len(key_ptr: i64, key_len: i32) -> i32
+          (import "freenet_delegate_secrets" "__frnt__delegate__get_secret_len"
+            (func $get_secret_len (param i64 i32) (result i32)))
+          ;; set_secret(key_ptr: i64, key_len: i32, val_ptr: i64, val_len: i32) -> i32
+          (import "freenet_delegate_secrets" "__frnt__delegate__set_secret"
+            (func $set_secret (param i64 i32 i64 i32) (result i32)))
+          ;; has_secret(key_ptr: i64, key_len: i32) -> i32
+          (import "freenet_delegate_secrets" "__frnt__delegate__has_secret"
+            (func $has_secret (param i64 i32) (result i32)))
+          ;; remove_secret(key_ptr: i64, key_len: i32) -> i32
+          (import "freenet_delegate_secrets" "__frnt__delegate__remove_secret"
+            (func $remove_secret (param i64 i32) (result i32)))
+          ;; get_contract_state_impl(id_ptr: i64, id_len: i32, out_ptr: i64, out_len: i64) -> i64
+          (import "freenet_delegate_contracts" "__frnt__delegate__get_contract_state"
+            (func $get_state (param i64 i32 i64 i64) (result i64)))
+          ;; get_contract_state_len_impl(id_ptr: i64, id_len: i32) -> i64
+          (import "freenet_delegate_contracts" "__frnt__delegate__get_contract_state_len"
+            (func $get_state_len (param i64 i32) (result i64)))
+          (memory (export "memory") 1)
+          (func (export "answer") (result i32) i32.const 42)
+        )
+        "#;
+
+        let config = RuntimeConfig::default();
+        let (engine, _, _) = WasmtimeEngine::create_engine(&config).unwrap();
+
+        let mut linker = Linker::new(&engine);
+        WasmtimeEngine::register_host_functions(&mut linker).expect("host function registration");
+
+        let module = Module::new(&engine, wat).expect("WAT compilation failed");
+        let mut store = Store::new(&engine, HostState::new(DEFAULT_MAX_MEMORY_PAGES));
+
+        let result = block_on_async(linker.instantiate_async(&mut store, &module));
+        assert!(
+            result.is_ok(),
+            "Instantiation failed — host function ABI mismatch: {}",
+            result.unwrap_err()
+        );
+    }
+
+    /// Verify that ensure_memory grows WASM linear memory when req_bytes
+    /// exceeds the initial allocation.
+    #[test]
+    fn test_ensure_memory_grows_when_needed() {
+        let config = RuntimeConfig::default();
+        let (engine, _, _) = WasmtimeEngine::create_engine(&config).unwrap();
+
+        // WAT module with only 1 page (64 KB) of initial memory
+        let wat = r#"
+        (module
+          (memory (export "memory") 1 256)
+          (func (export "answer") (result i32) i32.const 42)
+        )
+        "#;
+        let module = Module::new(&engine, wat).unwrap();
+        let mut store = Store::new(&engine, HostState::new(DEFAULT_MAX_MEMORY_PAGES));
+        let linker = Linker::new(&engine);
+        let instance = block_on_async(linker.instantiate_async(&mut store, &module)).unwrap();
+
+        // Initial memory is 1 page = 64 KB
+        let memory = instance.get_memory(&mut store, "memory").unwrap();
+        assert_eq!(memory.data_size(&store), 65536);
+
+        // Request 256 KB — should grow memory to at least 4 pages
+        WasmtimeEngine::ensure_memory(&mut store, &instance, 256 * 1024)
+            .expect("ensure_memory should grow successfully");
+
+        let new_size = memory.data_size(&store);
+        assert!(
+            new_size >= 256 * 1024,
+            "Memory should have grown to at least 256 KB, got {} bytes",
+            new_size
+        );
+
+        // Request less than current size — should be a no-op
+        let size_before = memory.data_size(&store);
+        WasmtimeEngine::ensure_memory(&mut store, &instance, 1024)
+            .expect("ensure_memory with small req should succeed");
+        assert_eq!(
+            memory.data_size(&store),
+            size_before,
+            "Memory should not change when req_bytes < current size"
+        );
     }
 
     /// Test that demonstrates the memory difference between wasmer and wasmtime.
