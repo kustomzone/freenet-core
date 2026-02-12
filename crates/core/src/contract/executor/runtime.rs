@@ -1535,10 +1535,91 @@ impl Executor<Runtime> {
         let params = contract.params();
 
         if self.get_local_contract(key.id()).await.is_ok() {
-            // already existing contract, just try to merge states
-            return self
-                .perform_contract_update(key, UpdateData::State(state.into()))
-                .await;
+            // Contract already exists — merge states locally and broadcast async.
+            //
+            // We intentionally do NOT delegate to perform_contract_update here because
+            // its network mode path uses op_request() which blocks waiting for the
+            // network operation to complete (120s timeout). For client-initiated puts
+            // (e.g. fdev publish), the client needs a timely response. The network
+            // broadcast is fire-and-forget — if it fails, subscribers will still get
+            // the update via their next sync.
+            //
+            // NOTE: This simplified path does not handle contracts that require related
+            // contracts for update_state or validate_state. If update_state returns
+            // MissingRelated (new_state=None with non-empty related), it is treated as
+            // "no change". This is acceptable because no current contracts use related
+            // contracts (see issue #2870 for completing that mechanism).
+            let current_state = self
+                .state_store
+                .get(&key)
+                .await
+                .map_err(ExecutorError::other)?
+                .clone();
+
+            let update = UpdateData::State(state.into());
+            let update_result = self
+                .runtime
+                .update_state(&key, &params, &current_state, &[update])
+                .map_err(|err| ExecutorError::execution(err, Some(InnerOpError::Upsert(key))))?;
+
+            // If update_state produced no new state, or the merged state is identical
+            // to current, return early with the current summary (no work to persist).
+            let new_state = match update_result.new_state {
+                Some(s) if s.as_ref() != current_state.as_ref() => {
+                    WrappedState::new(s.into_bytes())
+                }
+                _ => {
+                    let summary = self
+                        .runtime
+                        .summarize_state(&key, &params, &current_state)
+                        .map_err(|e| ExecutorError::execution(e, None))?;
+                    return Ok(ContractResponse::UpdateResponse { key, summary }.into());
+                }
+            };
+
+            // Validate before persisting
+            match self
+                .runtime
+                .validate_state(&key, &params, &new_state, &RelatedContracts::default())
+                .map_err(|e| ExecutorError::execution(e, None))?
+            {
+                ValidateResult::Valid => {}
+                ValidateResult::Invalid => {
+                    return Err(ExecutorError::request(StdContractError::Put {
+                        key,
+                        cause: "invalid outcome state after merge".into(),
+                    }));
+                }
+                ValidateResult::RequestRelated(_) => {
+                    return Err(ExecutorError::request(StdContractError::Put {
+                        key,
+                        cause: "missing related contracts for validation".into(),
+                    }));
+                }
+            }
+
+            // Commit locally
+            self.state_store
+                .update(&key, new_state.clone())
+                .await
+                .map_err(ExecutorError::other)?;
+
+            self.send_update_notification(&key, &params, &new_state)
+                .await
+                .map_err(|_| {
+                    ExecutorError::request(StdContractError::Put {
+                        key,
+                        cause: "failed while sending notifications".into(),
+                    })
+                })?;
+
+            self.broadcast_state_change(key, new_state.clone()).await;
+
+            let summary = self
+                .runtime
+                .summarize_state(&key, &params, &new_state)
+                .map_err(|e| ExecutorError::execution(e, None))?;
+            return Ok(ContractResponse::UpdateResponse { key, summary }.into());
         }
 
         self.verify_and_store_contract(state.clone(), contract, related_contracts)
@@ -1553,22 +1634,7 @@ impl Executor<Runtime> {
                 })
             })?;
 
-        // Notify network peers of state change (automatic propagation)
-        if let Some(op_manager) = &self.op_manager {
-            if let Err(err) = op_manager
-                .notify_node_event(crate::message::NodeEvent::BroadcastStateChange {
-                    key,
-                    new_state: state.clone(),
-                })
-                .await
-            {
-                tracing::warn!(
-                    contract = %key,
-                    error = %err,
-                    "Failed to broadcast state change to network peers"
-                );
-            }
-        }
+        self.broadcast_state_change(key, state.clone()).await;
 
         Ok(ContractResponse::PutResponse { key }.into())
     }
@@ -2205,6 +2271,28 @@ impl Executor<Runtime> {
             }));
         }
         Ok(())
+    }
+
+    /// Broadcasts a state change to network peers via the op_manager.
+    ///
+    /// This is fire-and-forget: failures are logged but do not propagate errors,
+    /// since peers will eventually sync via their next subscription renewal.
+    async fn broadcast_state_change(&self, key: ContractKey, new_state: WrappedState) {
+        if let Some(op_manager) = &self.op_manager {
+            if let Err(err) = op_manager
+                .notify_node_event(crate::message::NodeEvent::BroadcastStateChange {
+                    key,
+                    new_state,
+                })
+                .await
+            {
+                tracing::warn!(
+                    contract = %key,
+                    error = %err,
+                    "Failed to broadcast state change to network peers"
+                );
+            }
+        }
     }
 
     /// Delivers update notifications to LOCAL client subscriptions via websocket channels.
