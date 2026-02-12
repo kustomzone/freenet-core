@@ -530,6 +530,41 @@ impl OpManager {
         Ok(())
     }
 
+    /// Non-blocking variant of [`notify_op_change`] that fails fast when the
+    /// notification channel is full instead of blocking for 30 seconds.
+    /// On failure the pushed operation is cleaned up so it does not leak.
+    pub async fn notify_op_change_nonblocking(
+        &self,
+        msg: NetMessage,
+        op: OpEnum,
+    ) -> Result<(), OpError> {
+        let tx = *msg.id();
+        self.push(tx, op).await?;
+
+        match self
+            .to_event_listener
+            .notifications_sender()
+            .try_send(Either::Left(msg))
+        {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!(
+                    tx = %tx,
+                    channel_pending = self.to_event_listener.notification_channel_pending(),
+                    "notify_op_change_nonblocking: channel full, failing fast"
+                );
+                self.completed(tx);
+                Err(OpError::NotificationChannelError(
+                    "notification channel full (non-blocking send)".into(),
+                ))
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                self.completed(tx);
+                Err(OpError::NotificationError)
+            }
+        }
+    }
+
     // An early, fast path, return for communicating events in the node to the main message handler,
     // without any transmission in the network whatsoever and avoiding any state transition.
     //
