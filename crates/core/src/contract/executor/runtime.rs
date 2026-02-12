@@ -1013,33 +1013,20 @@ impl ContractExecutor for Executor<Runtime> {
                 }));
             }
         };
-        match self
+        let result = self
             .runtime
             .validate_state(&key, &params, &updated_state, &related_contracts)
-            .map_err(|e| ExecutorError::execution(e, None))?
-        {
-            ValidateResult::Valid => {
-                if updated_state.as_ref() == current_state.as_ref() {
-                    Ok(UpsertResult::NoChange)
-                } else {
-                    // Persist the updated state before returning
-                    self.state_store
-                        .update(&key, updated_state.clone())
-                        .await
-                        .map_err(ExecutorError::other)?;
+            .map_err(|e| ExecutorError::execution(e, None))?;
 
-                    // Note: Network propagation is handled automatically via BroadcastStateChange
-                    // event in attempt_state_update(), which notifies interested network peers.
-                    Ok(UpsertResult::Updated(updated_state))
-                }
-            }
-            ValidateResult::Invalid => Err(ExecutorError::request(
-                freenet_stdlib::client_api::ContractError::Update {
-                    key,
-                    cause: "invalid outcome state".into(),
-                },
-            )),
-            ValidateResult::RequestRelated(_) => todo!(),
+        if result != ValidateResult::Valid {
+            return Err(Self::validation_error(key, result));
+        }
+        if updated_state.as_ref() == current_state.as_ref() {
+            Ok(UpsertResult::NoChange)
+        } else {
+            self.commit_state_update(&key, &params, &updated_state)
+                .await?;
+            Ok(UpsertResult::Updated(updated_state))
         }
     }
 
@@ -1675,7 +1662,6 @@ impl Executor<Runtime> {
                 .runtime
                 .summarize_state(&key, &parameters, &new_state)
                 .map_err(|e| ExecutorError::execution(e, None))?;
-            // Note: notification is sent by attempt_state_update, no need to send again
             return Ok(ContractResponse::UpdateResponse { key, summary }.into());
         }
 
@@ -1808,7 +1794,7 @@ impl Executor<Runtime> {
         // Notification flow in this path:
         // 1. compute_state_update does NOT send notifications (by design)
         // 2. Network operation calls update_contract -> UpdateQuery -> upsert_contract_state
-        // 3. upsert_contract_state -> attempt_state_update sends the notification
+        // 3. upsert_contract_state validates, then commit_state_update sends the notification
         tracing::debug!(
             contract = %key,
             new_size_bytes = new_state.as_ref().len(),
@@ -1880,8 +1866,11 @@ impl Executor<Runtime> {
         }
     }
 
-    /// Attempts to update the state with the provided updates.
-    /// If there were no updates, it will return the current state.
+    /// Computes the updated state by running the contract's update_state function.
+    ///
+    /// This is a pure computation — it does NOT persist, notify, or broadcast.
+    /// Callers must validate the result and then call `commit_state_update()`
+    /// to persist and propagate the change.
     async fn attempt_state_update(
         &mut self,
         parameters: &Parameters<'_>,
@@ -1924,6 +1913,18 @@ impl Executor<Runtime> {
             return Ok(Either::Left(current_state.clone()));
         }
 
+        Ok(Either::Left(new_state))
+    }
+
+    /// Persists, notifies subscribers, and broadcasts a validated state update.
+    ///
+    /// Must only be called AFTER `validate_state()` confirms the state is valid.
+    async fn commit_state_update(
+        &mut self,
+        key: &ContractKey,
+        parameters: &Parameters<'_>,
+        new_state: &WrappedState,
+    ) -> Result<(), ExecutorError> {
         self.state_store
             .update(key, new_state.clone())
             .await
@@ -1937,7 +1938,7 @@ impl Executor<Runtime> {
         );
 
         if let Err(err) = self
-            .send_update_notification(key, parameters, &new_state)
+            .send_update_notification(key, parameters, new_state)
             .await
         {
             tracing::error!(
@@ -1966,7 +1967,26 @@ impl Executor<Runtime> {
             }
         }
 
-        Ok(Either::Left(new_state))
+        Ok(())
+    }
+
+    /// Converts a non-Valid `ValidateResult` into an appropriate `ExecutorError`.
+    fn validation_error(key: ContractKey, result: ValidateResult) -> ExecutorError {
+        match result {
+            ValidateResult::Valid => unreachable!("called validation_error on Valid result"),
+            ValidateResult::Invalid => {
+                ExecutorError::request(freenet_stdlib::client_api::ContractError::Update {
+                    key,
+                    cause: "invalid outcome state".into(),
+                })
+            }
+            ValidateResult::RequestRelated(_) => {
+                ExecutorError::request(freenet_stdlib::client_api::ContractError::Update {
+                    key,
+                    cause: "missing related contracts for validation".into(),
+                })
+            }
+        }
     }
 
     /// Given a contract and a series of delta updates, it will try to perform an update
@@ -1989,8 +2009,6 @@ impl Executor<Runtime> {
                     .await?;
                 let missing = match state_update_res {
                     Either::Left(new_state) => {
-                        // Note: attempt_state_update already commits the state to storage,
-                        // so we don't need to call state_store.update again here.
                         break new_state;
                     }
                     Either::Right(missing) => missing,
@@ -2064,6 +2082,22 @@ impl Executor<Runtime> {
                 }
             }
         };
+
+        // Validate before persisting or broadcasting.
+        // Empty RelatedContracts: this local-mode path passes related data as
+        // UpdateData entries to update_state rather than via RelatedContracts.
+        let result = self
+            .runtime
+            .validate_state(&key, parameters, &new_state, &RelatedContracts::default())
+            .map_err(|e| ExecutorError::execution(e, None))?;
+
+        if result != ValidateResult::Valid {
+            return Err(Self::validation_error(key, result));
+        }
+        if new_state.as_ref() != current_state.as_ref() {
+            self.commit_state_update(&key, parameters, &new_state)
+                .await?;
+        }
         Ok(new_state)
     }
 
