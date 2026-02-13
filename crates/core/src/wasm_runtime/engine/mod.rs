@@ -11,16 +11,19 @@
 //! - [`InstanceHandle`]: opaque handle to a live WASM instance
 //! - [`WasmError`]: unified error type for all WASM operations
 //!
-//! # Sync vs Async Execution
+//! # Execution Modes
 //!
-//! The engine provides two execution modes:
+//! The engine provides two calling conventions, both synchronous at the trait level:
 //!
-//! - **Synchronous** (`call_2i64`, `call_3i64`): Executes WASM on the calling thread.
-//!   Used for delegate `process()` calls where thread-local state is required.
+//! - **Synchronous** (`call_3i64`, `call_3i64_async_imports`): Used for delegate
+//!   `process()` calls. Runs on the current thread. Wasmtime internally uses
+//!   `call_async()` via a `block_on_async` helper; wasmer calls directly.
+//!   `call_3i64_async_imports` is the variant for V2 delegates with async host
+//!   function imports (wasmer needs `Store::into_async()` + `call_async()` for these).
 //!
-//! - **Blocking** (`call_2i64_blocking`, `call_3i64_blocking`): Offloads WASM to a
-//!   blocking thread with timeout. Used for contract operations that may take seconds.
-//!   The wasmer backend uses `spawn_blocking` + poll with timeout.
+//! - **Blocking with timeout** (`call_2i64_blocking`, `call_3i64_blocking`): Offloads
+//!   WASM to a blocking thread with timeout. Used for contract operations that may
+//!   take seconds.
 
 // Ensure exactly one backend is selected
 #[cfg(all(feature = "wasmer-backend", feature = "wasmtime-backend"))]
