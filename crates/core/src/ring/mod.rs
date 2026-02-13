@@ -1138,7 +1138,14 @@ impl Ring {
         // Suspend/resume detection: boot_time::Instant uses CLOCK_BOOTTIME on Linux,
         // which advances during suspend (unlike std/tokio Instant which use CLOCK_MONOTONIC).
         let mut last_boot_time = boot_time::Instant::now();
+        // In production (60s tick), 2x = 120s threshold is fine since real suspend
+        // causes minute+ jumps. In tests (2s tick), 2x = 4s is too tight — CI runners
+        // under load can have >4s scheduling delays between loop iterations, causing
+        // false positives that drop all connections mid-test. Use 30s minimum.
+        #[cfg(not(test))]
         const SUSPEND_DETECTION_THRESHOLD: Duration = CHECK_TICK_DURATION.saturating_mul(2);
+        #[cfg(test)]
+        const SUSPEND_DETECTION_THRESHOLD: Duration = Duration::from_secs(30);
 
         let mut this_peer = None;
         loop {
@@ -1184,9 +1191,24 @@ impl Ring {
             if boot_elapsed > SUSPEND_DETECTION_THRESHOLD {
                 tracing::warn!(
                     boot_elapsed_secs = boot_elapsed.as_secs(),
-                    "Detected suspend/resume (boot-time jump) — clearing all backoff state"
+                    "Detected suspend/resume (boot-time jump) — dropping all connections and clearing state"
                 );
                 reset_all_backoff();
+                // Clear recently-failed addresses since they may be reachable again.
+                self.connection_manager.cleanup_all_failed_addrs();
+                // Drop all connections (including transient gateway connections).
+                // After suspend, transport sockets are dead but connection entries
+                // persist as zombies — keepalive tasks exit on socket error but
+                // don't trigger connection cleanup. The bootstrap loop then sends
+                // CONNECT messages into dead sockets that never reach the gateway.
+                notifier
+                    .notifications_sender
+                    .send(Either::Right(crate::message::NodeEvent::DropAllConnections))
+                    .await
+                    .map_err(|error| {
+                        tracing::debug!(?error, "Failed to send DropAllConnections");
+                        error
+                    })?;
                 zero_connections_since = None;
             }
 
