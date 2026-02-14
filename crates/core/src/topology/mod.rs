@@ -20,7 +20,7 @@
 //! | Connections | Target Location Strategy |
 //! |-------------|-------------------------|
 //! | 0 to DENSITY_SELECTION_THRESHOLD-1 | Own location (if known), else random |
-//! | DENSITY_SELECTION_THRESHOLD+       | Density-based (target high-request areas) |
+//! | DENSITY_SELECTION_THRESHOLD+       | Distance-weighted density (score = density/distance, biased toward own location) |
 //!
 //! See `constants::DENSITY_SELECTION_THRESHOLD` (currently 5).
 //!
@@ -408,33 +408,23 @@ impl TopologyManager {
                 // If we have 1-4 connections, target own location to build local neighborhood
                 else if current_connections < DENSITY_SELECTION_THRESHOLD {
                     match my_location {
-                        Some(location) => {
-                            for _i in 0..below_threshold {
-                                locations.push(*location);
-                            }
-                        }
-                        None => {
-                            for _i in 0..below_threshold {
-                                locations.push(Location::random());
-                            }
-                        }
+                        Some(location) => locations.resize(below_threshold, *location),
+                        None => locations.extend((0..below_threshold).map(|_| Location::random())),
                     }
                 }
                 // If we have 5+ connections, use density-based selection
                 else {
                     return self
-                        .select_connections_to_add(neighbor_locations)
+                        .select_connections_to_add(neighbor_locations, my_location)
                         .unwrap_or_else(|e| {
                             debug!(
                                 error = ?e,
                                 fallback_count = below_threshold,
                                 "Density-based selection failed, falling back to random locations"
                             );
-                            let mut fallback_locations = Vec::new();
-                            for _i in 0..below_threshold {
-                                fallback_locations.push(Location::random());
-                            }
-                            TopologyAdjustment::AddConnections(fallback_locations)
+                            let fallback: Vec<_> =
+                                (0..below_threshold).map(|_| Location::random()).collect();
+                            TopologyAdjustment::AddConnections(fallback)
                         });
                 }
             }
@@ -480,7 +470,7 @@ impl TopologyManager {
                     "Resource usage below threshold, adding connections"
                 );
                 self.update_connection_acquisition_strategy(ConnectionAcquisitionStrategy::Fast);
-                self.select_connections_to_add(neighbor_locations)
+                self.select_connections_to_add(neighbor_locations, my_location)
             } else if usage_proportion > decrease_usage_if_above {
                 debug!(
                     resource_type = ?resource_type,
@@ -565,6 +555,7 @@ impl TopologyManager {
     fn select_connections_to_add(
         &mut self,
         neighbor_locations: &BTreeMap<Location, Vec<Connection>>,
+        my_location: &Option<Location>,
     ) -> anyhow::Result<TopologyAdjustment> {
         if neighbor_locations.is_empty() {
             tracing::warn!("select_connections_to_add: neighbor map empty, skipping adjustment");
@@ -580,19 +571,18 @@ impl TopologyManager {
             .create_density_map(neighbor_locations)?;
         debug!("Density map computed successfully");
 
-        debug!("Attempting to get max density location");
-        let max_density_location = match density_map.get_max_density() {
-            Ok(location) => {
-                debug!(location = %location, "Max density location found");
-                location
-            }
-            Err(e) => {
-                error!(error = ?e, "Failed to get max density location");
-                return Err(anyhow!(e));
-            }
-        };
-
-        info!(location = %max_density_location, "Adding new connection");
+        // Phase 3 of topology formation: with 5+ connections, use density-weighted
+        // selection. When our location is known, bias toward nearby high-density areas
+        // (score = density/distance). Otherwise fall back to global max density.
+        let max_density_location = match my_location {
+            Some(loc) => density_map.get_max_density_weighted(*loc),
+            None => density_map.get_max_density(),
+        }
+        .map_err(|e| {
+            error!(error = ?e, "Failed to get max density location");
+            anyhow!(e)
+        })?;
+        info!(location = %max_density_location, ?my_location, "Adding new connection");
         Ok(TopologyAdjustment::AddConnections(vec![
             max_density_location,
         ]))
@@ -977,6 +967,56 @@ mod tests {
                 }
             }
             _ => panic!("Expected AddConnections, but was: {adjustment:?}"),
+        }
+    }
+
+    // Test that density-based selection uses distance weighting when my_location is known.
+    // With 5+ connections (above DENSITY_SELECTION_THRESHOLD), adjust_topology should call
+    // select_connections_to_add which uses get_max_density_weighted.
+    #[test_log::test]
+    fn test_density_selection_uses_weighted_when_location_known() {
+        let mut resource_manager = setup_topology_manager(1000.0);
+        let peers: Vec<PeerKeyLocation> = generate_random_peers(6);
+        // Low bandwidth to trigger "add connections" path
+        let bw_usage_by_peer = vec![5, 5, 5, 5, 5, 5];
+        let report_time = Instant::now() - SOURCE_RAMP_UP_DURATION - Duration::from_secs(30);
+        report_resource_usage(
+            &mut resource_manager,
+            &peers,
+            &bw_usage_by_peer,
+            report_time,
+        );
+        // Concentrate requests on the first two peers (closest in sorted order)
+        let requests_per_peer = vec![50, 50, 1, 1, 1, 1];
+        report_outbound_requests(&mut resource_manager, &peers, &requests_per_peer);
+
+        let mut neighbor_locations = BTreeMap::new();
+        for peer in &peers {
+            neighbor_locations.insert(peer.location().unwrap(), vec![]);
+        }
+
+        let my_location = peers[0].location().unwrap();
+        let adjustment = resource_manager.adjust_topology(
+            &neighbor_locations,
+            &Some(my_location),
+            Instant::now(),
+            peers.len(),
+        );
+
+        match adjustment {
+            TopologyAdjustment::AddConnections(locations) => {
+                assert_eq!(locations.len(), 1);
+                // The chosen location should be biased toward my_location due to
+                // distance weighting. It should be between the first two peers
+                // (where requests are concentrated and closest to my_location).
+                let dist_to_me = my_location.distance(locations[0]).as_f64();
+                assert!(
+                    dist_to_me < 0.3,
+                    "Expected location near my_location ({my_location}), got {} (dist={dist_to_me})",
+                    locations[0]
+                );
+            }
+            _ => panic!("Expected AddConnections, got {adjustment:?}"),
         }
     }
 
