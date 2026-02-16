@@ -117,6 +117,23 @@ pub(super) struct DelegateCallEnv {
 unsafe impl Send for DelegateCallEnv {}
 unsafe impl Sync for DelegateCallEnv {}
 
+/// Typed errors from `DelegateCallEnv` contract operations.
+///
+/// Replaces string-based error matching so `_impl` host functions can map
+/// errors to the correct error code without fragile `contains()` checks.
+#[derive(Debug)]
+#[allow(dead_code)] // StorageError(String) is used for error logging via Debug
+pub(super) enum DelegateEnvError {
+    /// State store (ReDb) is not configured on this runtime.
+    StoreNotConfigured,
+    /// Contract code hash not found in the ContractStore index.
+    ContractCodeNotRegistered,
+    /// No existing state for this contract (required by UPDATE).
+    NoExistingState,
+    /// ReDb read/write error.
+    StorageError(String),
+}
+
 impl DelegateCallEnv {
     /// Create a new call environment.
     ///
@@ -169,6 +186,18 @@ impl DelegateCallEnv {
         unsafe { &*self.contract_store }
     }
 
+    /// Resolve a ContractInstanceId to a ContractKey using the contract index.
+    fn resolve_contract_key(
+        &self,
+        instance_id: &ContractInstanceId,
+    ) -> Result<ContractKey, DelegateEnvError> {
+        let code_hash = self
+            .contract_store()
+            .code_hash_from_id(instance_id)
+            .ok_or(DelegateEnvError::ContractCodeNotRegistered)?;
+        Ok(ContractKey::from_id_and_code(*instance_id, code_hash))
+    }
+
     /// Look up contract state by instance ID using the local ReDb store.
     ///
     /// Returns `Some(state_bytes)` if found, `None` if the contract is not stored locally.
@@ -180,27 +209,94 @@ impl DelegateCallEnv {
     pub(super) fn get_contract_state_sync(
         &self,
         instance_id: &ContractInstanceId,
-    ) -> Result<Option<Vec<u8>>, String> {
+    ) -> Result<Option<Vec<u8>>, DelegateEnvError> {
         let Some(ref db) = self.state_store_db else {
-            return Err("state store not available (V2 contract access not configured)".into());
+            return Err(DelegateEnvError::StoreNotConfigured);
         };
 
-        // Step 1: Look up CodeHash from the contract index
+        // Look up CodeHash; return None (not error) if the instance is unknown
         let code_hash = match self.contract_store().code_hash_from_id(instance_id) {
             Some(ch) => ch,
             None => return Ok(None),
         };
 
-        // Step 2: Construct the full ContractKey
         let contract_key = ContractKey::from_id_and_code(*instance_id, code_hash);
 
-        // Step 3: Read state directly from ReDb via synchronous read transaction.
-        // No async wrapper, no futures::executor::block_on — just a plain read txn.
         match db.get_state_sync(&contract_key) {
             Ok(Some(wrapped_state)) => Ok(Some(wrapped_state.as_ref().to_vec())),
             Ok(None) => Ok(None),
-            Err(e) => Err(format!("state store read error: {e}")),
+            Err(e) => Err(DelegateEnvError::StorageError(e.to_string())),
         }
+    }
+
+    /// Store (PUT) contract state by instance ID.
+    ///
+    /// The contract's code hash must already be registered in the ContractStore
+    /// index (i.e., the contract code was previously stored). This writes the
+    /// state to ReDb synchronously.
+    ///
+    /// Returns `Ok(())` on success.
+    pub(super) fn put_contract_state_sync(
+        &self,
+        instance_id: &ContractInstanceId,
+        state: Vec<u8>,
+    ) -> Result<(), DelegateEnvError> {
+        let Some(ref db) = self.state_store_db else {
+            return Err(DelegateEnvError::StoreNotConfigured);
+        };
+
+        let contract_key = self.resolve_contract_key(instance_id)?;
+
+        db.store_state_sync(
+            &contract_key,
+            freenet_stdlib::prelude::WrappedState::new(state),
+        )
+        .map_err(|e| DelegateEnvError::StorageError(e.to_string()))
+    }
+
+    /// Update contract state by instance ID.
+    ///
+    /// Like PUT, but only succeeds if the contract already has stored state.
+    /// Returns an error if no prior state exists.
+    pub(super) fn update_contract_state_sync(
+        &self,
+        instance_id: &ContractInstanceId,
+        state: Vec<u8>,
+    ) -> Result<(), DelegateEnvError> {
+        let Some(ref db) = self.state_store_db else {
+            return Err(DelegateEnvError::StoreNotConfigured);
+        };
+
+        let contract_key = self.resolve_contract_key(instance_id)?;
+
+        // Atomic check-and-write in a single ReDb write transaction.
+        match db.update_state_sync(
+            &contract_key,
+            freenet_stdlib::prelude::WrappedState::new(state),
+        ) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(DelegateEnvError::NoExistingState),
+            Err(e) => Err(DelegateEnvError::StorageError(e.to_string())),
+        }
+    }
+
+    /// Register a subscription interest for a contract.
+    ///
+    /// Currently validates that the contract is known (code hash resolvable)
+    /// and returns success. Actual notification delivery is a follow-up.
+    // TODO(#2830): Implement actual subscription notification delivery
+    // Currently this is a no-op beyond validation — delegates will believe they
+    // are subscribed but will never receive notifications.
+    pub(super) fn subscribe_contract_sync(
+        &self,
+        instance_id: &ContractInstanceId,
+    ) -> Result<(), DelegateEnvError> {
+        // Validate the contract is known
+        let _contract_key = self.resolve_contract_key(instance_id)?;
+
+        // No-op for now — real subscription notification delivery is a follow-up.
+        // The fact that we resolved the key validates the contract is registered.
+        Ok(())
     }
 }
 
@@ -860,12 +956,56 @@ pub(super) mod delegate_contracts {
             Err(e) => {
                 tracing::error!(
                     contract = %contract_id,
-                    error = %e,
+                    error = ?e,
                     "V2 delegate: state store error"
                 );
-                contract_error_codes::ERR_STORE_ERROR as i64
+                delegate_env_error_to_code(&e)
             }
         }
+    }
+
+    /// Map a `DelegateEnvError` to the appropriate contract error code.
+    fn delegate_env_error_to_code(err: &DelegateEnvError) -> i64 {
+        match err {
+            DelegateEnvError::StoreNotConfigured => contract_error_codes::ERR_STORE_ERROR as i64,
+            DelegateEnvError::ContractCodeNotRegistered => {
+                contract_error_codes::ERR_CONTRACT_CODE_NOT_REGISTERED as i64
+            }
+            DelegateEnvError::NoExistingState => {
+                contract_error_codes::ERR_CONTRACT_NOT_FOUND as i64
+            }
+            DelegateEnvError::StorageError(_) => contract_error_codes::ERR_STORE_ERROR as i64,
+        }
+    }
+
+    /// Read a 32-byte contract instance ID from WASM memory.
+    ///
+    /// Shared helper for all contract host functions. Validates the instance ID
+    /// pointer and length, returning the ContractInstanceId on success.
+    /// Only acquires and drops the MEM_ADDR guard to read WASM memory metadata.
+    fn read_instance_id(id_ptr: i64, id_len: i32) -> Result<ContractInstanceId, i64> {
+        let id = current_instance_id();
+        if id == -1 {
+            return Err(contract_error_codes::ERR_NOT_IN_PROCESS as i64);
+        }
+        if id_len != 32 {
+            tracing::warn!("delegate contract host fn: expected 32-byte instance ID, got {id_len}");
+            return Err(contract_error_codes::ERR_INVALID_PARAM as i64);
+        }
+        let Some(info) = MEM_ADDR.get(&id) else {
+            return Err(contract_error_codes::ERR_NOT_IN_PROCESS as i64);
+        };
+        let start_ptr = info.start_ptr;
+        let mem_size = info.mem_size;
+        drop(info);
+
+        let Some(id_src) = validate_and_compute_ptr::<u8>(id_ptr, start_ptr, 32, mem_size) else {
+            return Err(contract_error_codes::ERR_MEMORY_BOUNDS as i64);
+        };
+        let id_bytes: [u8; 32] = unsafe { std::slice::from_raw_parts(id_src, 32) }
+            .try_into()
+            .unwrap();
+        Ok(ContractInstanceId::new(id_bytes))
     }
 
     /// Implementation of get_contract_state.
@@ -961,10 +1101,186 @@ pub(super) mod delegate_contracts {
             Err(e) => {
                 tracing::error!(
                     contract = %contract_id,
-                    error = %e,
+                    error = ?e,
                     "V2 delegate: state store error"
                 );
-                contract_error_codes::ERR_STORE_ERROR as i64
+                delegate_env_error_to_code(&e)
+            }
+        }
+    }
+
+    /// Implementation of put_contract_state.
+    ///
+    /// Writes contract state to the local ReDb store. Requires the contract's
+    /// code hash to be registered in the ContractStore index.
+    ///
+    /// ## Returns
+    /// - `0`: success
+    /// - Negative error code on failure
+    pub(crate) fn put_contract_state_impl(
+        id_ptr: i64,
+        id_len: i32,
+        state_ptr: i64,
+        state_len: i64,
+    ) -> i64 {
+        let contract_id = match read_instance_id(id_ptr, id_len) {
+            Ok(id) => id,
+            Err(code) => return code,
+        };
+
+        if state_len < 0 {
+            tracing::warn!("delegate put_contract_state: negative state_len={state_len}");
+            return contract_error_codes::ERR_INVALID_PARAM as i64;
+        }
+
+        let id = current_instance_id();
+        let Some(info) = MEM_ADDR.get(&id) else {
+            return contract_error_codes::ERR_NOT_IN_PROCESS as i64;
+        };
+        let Some(env) = DELEGATE_ENV.get(&id) else {
+            return contract_error_codes::ERR_NOT_IN_PROCESS as i64;
+        };
+
+        // Read state bytes from WASM memory
+        let state_bytes = if state_len == 0 {
+            vec![]
+        } else {
+            let Some(src) = validate_and_compute_ptr::<u8>(
+                state_ptr,
+                info.start_ptr,
+                state_len as usize,
+                info.mem_size,
+            ) else {
+                tracing::error!("Memory bounds violation in delegate put_contract_state (state)");
+                return contract_error_codes::ERR_MEMORY_BOUNDS as i64;
+            };
+            unsafe { std::slice::from_raw_parts(src, state_len as usize) }.to_vec()
+        };
+
+        match env.put_contract_state_sync(&contract_id, state_bytes) {
+            Ok(()) => {
+                tracing::debug!(
+                    contract = %contract_id,
+                    "V2 delegate: put_contract_state succeeded"
+                );
+                contract_error_codes::SUCCESS as i64
+            }
+            Err(ref e) => {
+                tracing::debug!(
+                    contract = %contract_id,
+                    error = ?e,
+                    "V2 delegate: put_contract_state failed"
+                );
+                delegate_env_error_to_code(e)
+            }
+        }
+    }
+
+    /// Implementation of update_contract_state.
+    ///
+    /// Like PUT, but only succeeds if the contract already has stored state.
+    ///
+    /// ## Returns
+    /// - `0`: success
+    /// - `ERR_CONTRACT_NOT_FOUND (-7)`: no existing state to update
+    /// - Negative error code on other failures
+    pub(crate) fn update_contract_state_impl(
+        id_ptr: i64,
+        id_len: i32,
+        state_ptr: i64,
+        state_len: i64,
+    ) -> i64 {
+        let contract_id = match read_instance_id(id_ptr, id_len) {
+            Ok(id) => id,
+            Err(code) => return code,
+        };
+
+        if state_len < 0 {
+            tracing::warn!("delegate update_contract_state: negative state_len={state_len}");
+            return contract_error_codes::ERR_INVALID_PARAM as i64;
+        }
+
+        let id = current_instance_id();
+        let Some(info) = MEM_ADDR.get(&id) else {
+            return contract_error_codes::ERR_NOT_IN_PROCESS as i64;
+        };
+        let Some(env) = DELEGATE_ENV.get(&id) else {
+            return contract_error_codes::ERR_NOT_IN_PROCESS as i64;
+        };
+
+        // Read state bytes from WASM memory
+        let state_bytes = if state_len == 0 {
+            vec![]
+        } else {
+            let Some(src) = validate_and_compute_ptr::<u8>(
+                state_ptr,
+                info.start_ptr,
+                state_len as usize,
+                info.mem_size,
+            ) else {
+                tracing::error!(
+                    "Memory bounds violation in delegate update_contract_state (state)"
+                );
+                return contract_error_codes::ERR_MEMORY_BOUNDS as i64;
+            };
+            unsafe { std::slice::from_raw_parts(src, state_len as usize) }.to_vec()
+        };
+
+        match env.update_contract_state_sync(&contract_id, state_bytes) {
+            Ok(()) => {
+                tracing::debug!(
+                    contract = %contract_id,
+                    "V2 delegate: update_contract_state succeeded"
+                );
+                contract_error_codes::SUCCESS as i64
+            }
+            Err(ref e) => {
+                tracing::debug!(
+                    contract = %contract_id,
+                    error = ?e,
+                    "V2 delegate: update_contract_state failed"
+                );
+                delegate_env_error_to_code(e)
+            }
+        }
+    }
+
+    /// Implementation of subscribe_contract.
+    ///
+    /// Validates that the contract is known (code hash resolvable) and registers
+    /// subscription interest. Currently a no-op beyond validation; real notification
+    /// delivery is a follow-up.
+    ///
+    /// ## Returns
+    /// - `0`: success (contract is known, subscription registered)
+    /// - `ERR_CONTRACT_CODE_NOT_REGISTERED (-10)`: unknown contract
+    /// - Negative error code on other failures
+    pub(crate) fn subscribe_contract_impl(id_ptr: i64, id_len: i32) -> i64 {
+        let contract_id = match read_instance_id(id_ptr, id_len) {
+            Ok(id) => id,
+            Err(code) => return code,
+        };
+
+        let id = current_instance_id();
+        let Some(env) = DELEGATE_ENV.get(&id) else {
+            return contract_error_codes::ERR_NOT_IN_PROCESS as i64;
+        };
+
+        match env.subscribe_contract_sync(&contract_id) {
+            Ok(()) => {
+                tracing::debug!(
+                    contract = %contract_id,
+                    "V2 delegate: subscribe_contract succeeded"
+                );
+                contract_error_codes::SUCCESS as i64
+            }
+            Err(ref e) => {
+                tracing::debug!(
+                    contract = %contract_id,
+                    error = ?e,
+                    "V2 delegate: subscribe_contract failed"
+                );
+                delegate_env_error_to_code(e)
             }
         }
     }
