@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::time::Instant;
 
@@ -80,11 +80,12 @@ impl HttpClientApi {
         socket: &SocketAddr,
         attested_contracts: AttestedContractMap,
     ) -> (Self, Router) {
-        let localhost = match socket.ip() {
-            IpAddr::V4(ip) if ip.is_loopback() || ip.is_unspecified() => true,
-            IpAddr::V6(ip) if ip.is_loopback() || ip.is_unspecified() => true,
-            _ => false,
-        };
+        // Controls the cookie Secure flag: when true, cookies are sent over HTTP
+        // (no HTTPS required). Includes is_unspecified() so that 0.0.0.0 bindings
+        // (network mode) allow HTTP cookies — most home users lack TLS.
+        // Note: this is intentionally different from `localhost_only` in mod.rs,
+        // which uses only is_loopback() to control WebSocket origin restrictions.
+        let localhost = socket.ip().is_loopback() || socket.ip().is_unspecified();
         let contract_web_path = std::env::temp_dir().join("freenet").join("webs");
         std::fs::create_dir_all(contract_web_path).unwrap();
 
@@ -100,7 +101,7 @@ impl HttpClientApi {
         (
             Self {
                 proxy_server_request: request_to_server,
-                attested_contracts: attested_contracts.clone(),
+                attested_contracts,
                 response_channels: HashMap::new(),
             },
             router,
@@ -132,16 +133,13 @@ async fn web_home(
 ) -> Result<axum::response::Response, WebSocketApiError> {
     use headers::{Header, HeaderMapExt};
 
-    let domain = config
-        .localhost
-        .then_some("localhost")
-        .expect("non-local connections not supported yet");
     let token = AuthToken::generate();
 
     let auth_header = headers::Authorization::<headers::authorization::Bearer>::name().to_string();
     let version_prefix = api_version.prefix();
+    // Don't set a cookie domain — the browser will default to the request's origin host,
+    // which works for both localhost and remote access.
     let cookie = cookie::Cookie::build((auth_header, format!("Bearer {}", token.as_str())))
-        .domain(domain)
         .path(format!("/{version_prefix}/contract/web/{key}"))
         .same_site(cookie::SameSite::Strict)
         .max_age(cookie::time::Duration::days(1))
