@@ -9,6 +9,10 @@ use freenet::config::{GlobalRng, GlobalSimulationTime};
 use freenet::dev_tool::SimNetwork;
 use std::time::Duration;
 
+fn reset_counters() {
+    GlobalRng::reset_thread_index_counter();
+}
+
 async fn let_network_run(sim: &mut SimNetwork, duration: Duration) {
     let step = Duration::from_millis(100);
     let mut elapsed = Duration::ZERO;
@@ -29,9 +33,9 @@ async fn test_verify_state_produces_report() {
     const BASE_EPOCH_MS: u64 = 1577836800000;
     const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000;
 
-    freenet::dev_tool::reset_all_simulation_state();
     GlobalRng::set_seed(SEED);
     GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + (SEED % RANGE_MS));
+    reset_counters();
 
     let mut sim = SimNetwork::new("verify-state-test", 1, 3, 7, 3, 10, 2, SEED).await;
     sim.with_start_backoff(Duration::from_millis(50));
@@ -74,9 +78,9 @@ async fn test_verify_state_filter_methods() {
     const BASE_EPOCH_MS: u64 = 1577836800000;
     const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000;
 
-    freenet::dev_tool::reset_all_simulation_state();
     GlobalRng::set_seed(SEED);
     GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + (SEED % RANGE_MS));
+    reset_counters();
 
     let mut sim = SimNetwork::new("verify-filter-test", 1, 3, 7, 3, 10, 2, SEED).await;
     sim.with_start_backoff(Duration::from_millis(50));

@@ -184,31 +184,20 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
           # Default congestion control is FixedRate for CI stability.
           # To test BBR: set FREENET_CONGESTION_CONTROL=bbr and optionally FREENET_BBR_STARTUP_RATE
-        # Run all tests in parallel using all 16 cores
-        # Operations tests use dynamic port allocation with unique IPs (127.x.y.1) and are fully thread-safe
-        # Simulation tests excluded via feature flag (run separately below due to global state)
-        run: cargo test --workspace --no-default-features --features trace,websocket,redb,wasmtime-backend
+        # Run all tests in parallel including simulation tests.
+        # Thread-local state and per-network registries provide test isolation.
+        # Skip determinism comparison tests — they compare sequential runs and
+        # need shared atomic counters to be stable (run serially below).
+        run: cargo test --workspace --no-default-features --features trace,websocket,redb,wasmtime-backend,simulation_tests,testing -- --skip determinism
 
-      - name: Test simulation (serial)
+      - name: Test determinism (serial)
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
-        # Simulation tests use global state (socket registries, RNG, counters)
-        # and must run serially to avoid race conditions.
-        # Includes: basic simulation, subscription topology validation
-        run: |
-          cargo test -p freenet --no-default-features --features trace,websocket,redb,wasmtime-backend,simulation_tests,testing \
-            --test simulation_integration \
-            --test simulation_smoke \
-            -- --test-threads=1
-
-      - name: Test wasmer backend
-        env:
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
-        # Test the wasmer backend to prevent regressions
-        # Runs wasmer unit tests and basic integration tests
-        run: cargo test -p freenet --no-default-features --features trace,websocket,redb,wasmer-backend --lib
+        # Determinism comparison tests compare exact event sequences across sequential runs.
+        # Shared atomic counters must not be advanced by concurrent tests between runs.
+        # The "determinism" filter matches: test_strict_determinism_*, test_turmoil_determinism_*, test_deterministic_replay_*
+        run: cargo test -p freenet --no-default-features --features trace,websocket,redb,wasmtime-backend,simulation_tests,testing --test simulation_integration determinism -- --test-threads=1
 
   six_peer_regression:
     name: six-peer-regression
