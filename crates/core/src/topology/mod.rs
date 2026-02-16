@@ -405,10 +405,19 @@ impl TopologyManager {
                         }
                     }
                 }
-                // If we have 1-4 connections, target own location to build local neighborhood
+                // With 1-4 connections, spread targets across the ring: first at
+                // own location (local clustering), rest evenly spaced. Distinct
+                // locations ensure all targets survive BTreeSet deduplication in
+                // the caller's pending queue.
                 else if current_connections < DENSITY_SELECTION_THRESHOLD {
                     match my_location {
-                        Some(location) => locations.resize(below_threshold, *location),
+                        Some(location) => {
+                            locations.push(*location);
+                            for i in 1..below_threshold {
+                                let offset = i as f64 / below_threshold as f64;
+                                locations.push(Location::new_rounded(location.as_f64() + offset));
+                            }
+                        }
                         None => locations.extend((0..below_threshold).map(|_| Location::random())),
                     }
                 }
@@ -1258,14 +1267,32 @@ mod tests {
                 // Should request 24 more connections to reach min of 25
                 assert_eq!(locations.len(), 24);
 
-                // When below DENSITY_SELECTION_THRESHOLD, ALL locations should target
-                // our own location to build a local neighborhood
-                for loc in &locations {
+                // First target should be own location (for local clustering)
+                assert_eq!(
+                    locations[0], my_location,
+                    "First connection should target own location"
+                );
+
+                // Remaining targets should be spread across the ring at evenly
+                // spaced offsets from own location.
+                for (i, loc) in locations.iter().enumerate().skip(1) {
+                    let expected_offset = i as f64 / 24.0;
+                    let expected = Location::new_rounded(my_location.as_f64() + expected_offset);
                     assert_eq!(
-                        *loc, my_location,
-                        "Early connections (below threshold) should target own location"
+                        *loc, expected,
+                        "Connection {i} should be at offset {expected_offset} from own location"
                     );
                 }
+
+                // All locations must be distinct so they survive BTreeSet
+                // deduplication in the caller's pending connection queue.
+                let as_set: std::collections::BTreeSet<Location> =
+                    locations.iter().copied().collect();
+                assert_eq!(
+                    as_set.len(),
+                    locations.len(),
+                    "All target locations must be distinct"
+                );
             }
             _ => panic!("Expected AddConnections, got {adjustment:?}"),
         }
