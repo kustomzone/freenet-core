@@ -1183,6 +1183,18 @@ impl P2pConnManager {
                                         }
                                     }
 
+                                    // Clean up pending operation result callbacks
+                                    // Drop all waiting senders so callers see channel closure
+                                    let pending_count = state.pending_op_results.len();
+                                    if pending_count > 0 {
+                                        tracing::debug!(
+                                            pending_count,
+                                            phase = "cleanup",
+                                            "Draining pending_op_results"
+                                        );
+                                        state.pending_op_results.drain();
+                                    }
+
                                     tracing::info!(
                                         phase = "shutdown",
                                         "Cleanup complete - exiting event loop"
@@ -3723,7 +3735,8 @@ impl ConnectResultSender for mpsc::Sender<Result<(SocketAddr, Option<usize>), ()
 struct EventListenerState {
     expected_inbound: ExpectedInboundTracker,
     pending_from_executor: HashSet<Transaction>,
-    // FIXME: we are potentially leaving trash here when transacrions are completed
+    /// Maps transactions to the set of clients waiting for their results.
+    /// Cleaned up via `TransactionTimedOut` and `TransactionCompleted` handlers.
     tx_to_client: HashMap<Transaction, HashSet<ClientId>>,
     client_waiting_transaction: Vec<(WaitingTransaction, HashSet<ClientId>)>,
     awaiting_connection: HashMap<SocketAddr, Vec<Box<dyn ConnectResultSender>>>,
