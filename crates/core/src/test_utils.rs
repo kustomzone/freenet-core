@@ -1221,11 +1221,17 @@ impl NodeInfo {
         )
     }
 
-    /// Wait for this node to become ready by polling its WebSocket API.
+    /// Wait for this node to become ready using a two-phase check.
     ///
-    /// This function attempts to connect to the node's WebSocket and verify it responds,
-    /// using exponential backoff polling. Returns as soon as the node is ready, rather than
-    /// waiting a fixed duration.
+    /// **Phase 1:** Verify the WebSocket API accepts connections and responds to a
+    /// diagnostics query. For gateways, this is sufficient (they are always "joined").
+    ///
+    /// **Phase 2 (non-gateway peers only):** Query `ConnectedPeers` and wait until at
+    /// least one connection exists, confirming the peer has completed its network join
+    /// handshake (which sets `peer_ready=true`).
+    ///
+    /// Uses exponential backoff polling. Returns as soon as the node is ready, rather
+    /// than waiting a fixed duration.
     ///
     /// # Arguments
     /// * `timeout` - Maximum time to wait for the node to become ready
@@ -1244,26 +1250,35 @@ impl NodeInfo {
         &self,
         timeout: std::time::Duration,
     ) -> anyhow::Result<std::time::Duration> {
-        use freenet_stdlib::client_api::{ClientRequest, NodeDiagnosticsConfig, NodeQuery, WebApi};
+        use freenet_stdlib::client_api::{
+            ClientRequest, HostResponse, NodeDiagnosticsConfig, NodeQuery, QueryResponse, WebApi,
+        };
         use std::time::Instant;
         use tokio::time::sleep;
 
         let start = Instant::now();
         let mut attempt = 0;
+        let mut ws_ready = false;
         let max_backoff = std::time::Duration::from_millis(500);
 
         loop {
             let elapsed = start.elapsed();
             if elapsed >= timeout {
+                let phase = if ws_ready {
+                    "WebSocket is up but peer has not joined the network"
+                } else {
+                    "WebSocket API is not responding"
+                };
                 return Err(anyhow::anyhow!(
-                    "Node '{}' did not become ready within {:?} (ws_port: {})",
+                    "Node '{}' did not become ready within {:?} (ws_port: {}, {})",
                     self.label,
                     timeout,
-                    self.ws_port
+                    self.ws_port,
+                    phase,
                 ));
             }
 
-            // Try to connect and send a simple diagnostics request
+            // Try to connect and verify the node is operational
             match tokio::time::timeout(
                 std::time::Duration::from_secs(2),
                 tokio_tungstenite::connect_async(&self.ws_url()),
@@ -1271,33 +1286,76 @@ impl NodeInfo {
             .await
             {
                 Ok(Ok((stream, _))) => {
-                    // Connected! Try to send a ping-like request
                     let mut client = WebApi::start(stream);
 
-                    // Send a minimal diagnostics request
-                    if client
-                        .send(ClientRequest::NodeQueries(NodeQuery::NodeDiagnostics {
-                            config: NodeDiagnosticsConfig {
-                                include_node_info: false,
-                                include_network_info: false,
-                                include_subscriptions: false,
-                                contract_keys: vec![],
-                                include_system_metrics: false,
-                                include_detailed_peer_info: false,
-                                include_subscriber_peer_ids: false,
-                            },
-                        }))
-                        .await
-                        .is_ok()
-                    {
-                        // Node is ready!
-                        tracing::debug!(
-                            "Node '{}' ready after {:?} ({} attempts)",
-                            self.label,
-                            elapsed,
-                            attempt + 1
-                        );
-                        return Ok(elapsed);
+                    if !ws_ready {
+                        // Phase 1: Verify WebSocket API responds to diagnostics
+                        if client
+                            .send(ClientRequest::NodeQueries(NodeQuery::NodeDiagnostics {
+                                config: NodeDiagnosticsConfig {
+                                    include_node_info: false,
+                                    include_network_info: false,
+                                    include_subscriptions: false,
+                                    contract_keys: vec![],
+                                    include_system_metrics: false,
+                                    include_detailed_peer_info: false,
+                                    include_subscriber_peer_ids: false,
+                                },
+                            }))
+                            .await
+                            .is_ok()
+                        {
+                            if self.is_gateway {
+                                // Gateways are always "joined" — no need to check peers
+                                tracing::debug!(
+                                    "Gateway '{}' ready after {:?} ({} attempts)",
+                                    self.label,
+                                    elapsed,
+                                    attempt + 1
+                                );
+                                return Ok(elapsed);
+                            }
+                            ws_ready = true;
+                            tracing::debug!(
+                                "Node '{}' WebSocket ready after {:?}, waiting for network join...",
+                                self.label,
+                                elapsed,
+                            );
+                        }
+                    } else {
+                        // Phase 2 (non-gateway only): Verify peer has joined the network
+                        // by querying ConnectedPeers. A joined peer will have at least one
+                        // connection (to its gateway). This query bypasses ensure_peer_ready,
+                        // but a peer with connections has necessarily completed the transport
+                        // handshake that sets peer_ready=true.
+                        if client
+                            .send(ClientRequest::NodeQueries(NodeQuery::ConnectedPeers))
+                            .await
+                            .is_ok()
+                        {
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(2),
+                                client.recv(),
+                            )
+                            .await
+                            {
+                                Ok(Ok(HostResponse::QueryResponse(
+                                    QueryResponse::ConnectedPeers { peers },
+                                ))) if !peers.is_empty() => {
+                                    tracing::debug!(
+                                        "Node '{}' joined network after {:?} ({} attempts, {} peers)",
+                                        self.label,
+                                        elapsed,
+                                        attempt + 1,
+                                        peers.len(),
+                                    );
+                                    return Ok(elapsed);
+                                }
+                                _ => {
+                                    // No peers yet — still joining
+                                }
+                            }
+                        }
                     }
                 }
                 _ => {
