@@ -252,14 +252,10 @@ pub(crate) struct OpManager {
     /// Wrapped in Arc for sharing with `garbage_cleanup_task`.
     request_router: Arc<OnceLock<Arc<RequestRouter>>>,
     /// Registry for handling race conditions between stream fragments and metadata messages.
-    /// Used when streaming is enabled to coordinate transport layer (which receives fragments)
-    /// with operations layer (which receives RequestStreaming/ResponseStreaming messages).
+    /// Coordinates transport layer (which receives fragments) with operations layer
+    /// (which receives RequestStreaming/ResponseStreaming messages).
     orphan_stream_registry: Arc<OrphanStreamRegistry>,
-    /// Whether streaming transport is enabled for large transfers.
-    /// When true, transfers larger than `streaming_threshold` use streaming.
-    pub streaming_enabled: bool,
     /// Size threshold in bytes above which streaming is used.
-    /// Only applies when `streaming_enabled` is true.
     pub streaming_threshold: usize,
     /// Backoff tracker for failed gateway connection attempts.
     /// Used to implement exponential backoff when retrying connections.
@@ -291,7 +287,6 @@ impl Clone for OpManager {
             interest_manager: self.interest_manager.clone(),
             request_router: self.request_router.clone(),
             orphan_stream_registry: self.orphan_stream_registry.clone(),
-            streaming_enabled: self.streaming_enabled,
             streaming_threshold: self.streaming_threshold,
             gateway_backoff: self.gateway_backoff.clone(),
             gateway_backoff_cleared: self.gateway_backoff_cleared.clone(),
@@ -370,22 +365,16 @@ impl OpManager {
         crate::ring::interest::InterestManager::start_sweep_task(interest_manager.clone());
 
         // Extract streaming config from NodeConfig
-        let streaming_enabled = config.config.network_api.streaming_enabled;
         let streaming_threshold = config.config.network_api.streaming_threshold;
 
-        if streaming_enabled {
-            tracing::info!(
-                streaming_threshold_bytes = streaming_threshold,
-                "Streaming transport enabled for large transfers"
-            );
-        }
+        tracing::info!(
+            streaming_threshold_bytes = streaming_threshold,
+            "Streaming transport enabled for large transfers"
+        );
 
-        // Create orphan stream registry (always created for transport layer)
-        // GC task only started when streaming is enabled
+        // Create orphan stream registry and start GC task
         let orphan_stream_registry = Arc::new(OrphanStreamRegistry::new());
-        if streaming_enabled {
-            OrphanStreamRegistry::start_gc_task(orphan_stream_registry.clone());
-        }
+        OrphanStreamRegistry::start_gc_task(orphan_stream_registry.clone());
 
         Ok(Self {
             ring,
@@ -403,7 +392,6 @@ impl OpManager {
             interest_manager,
             request_router,
             orphan_stream_registry,
-            streaming_enabled,
             streaming_threshold,
             gateway_backoff: Arc::new(Mutex::new(PeerConnectionBackoff::new())),
             gateway_backoff_cleared: Arc::new(tokio::sync::Notify::new()),
@@ -1006,11 +994,10 @@ impl OpManager {
 
     /// Determines if streaming should be used for a payload of the given size.
     ///
-    /// Returns `true` if streaming is enabled and the payload size exceeds
-    /// the streaming threshold.
+    /// Returns `true` if the payload size exceeds the streaming threshold.
     #[allow(dead_code)] // Phase 3 infrastructure - will be used when streaming handlers are implemented
     pub fn should_use_streaming(&self, payload_size: usize) -> bool {
-        self.streaming_enabled && payload_size > self.streaming_threshold
+        payload_size > self.streaming_threshold
     }
 
     /// Builds the messages we need to send to a peer that just joined the ring,
