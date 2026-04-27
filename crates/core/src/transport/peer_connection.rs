@@ -1477,7 +1477,31 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     return Ok(None);
                 }
 
-                // Legacy path: push to mpsc channel for existing recv() behavior
+                // Legacy path: push to mpsc channel for existing recv() behavior.
+                //
+                // This is one of the rare in-tree exceptions to the
+                // `.send().await`-in-recv-loop ban from
+                // `.claude/rules/channel-safety.md`. The receiver here is
+                // the freenet-spawned `recv_stream` reassembly task in
+                // `inbound_stream_futures` — it is NOT an external client
+                // consumer, and it has no upstream dependency on this
+                // recv loop. The cascading-backpressure deadlock pattern
+                // the rule prevents (slow external consumer stalls our
+                // event loop, which feeds another channel the consumer
+                // is waiting on) cannot form here because:
+                //   - the consumer is internal and same-runtime, with
+                //     bounded per-fragment work (BTreeMap insert + Vec extend),
+                //   - blocking is scoped per-connection (each peer has
+                //     its own recv loop), so it cannot starve other peers,
+                //   - the only effect of transient backpressure is brief
+                //     ACK/keepalive delay for THIS peer until `recv_stream`
+                //     drains.
+                //
+                // Switching to `try_send` was attempted in #3961 and reverted
+                // on review (Codex P1, skeptical reviewer M2): turning
+                // transient executor pressure into `ConnectionClosed` would
+                // abort otherwise-healthy large transfers whenever more than
+                // 64 fragments back up before `recv_stream` is scheduled.
                 if let Some(sender) = self.inbound_streams.get(&stream_id) {
                     sender
                         .send((fragment_number, payload))

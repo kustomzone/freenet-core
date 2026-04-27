@@ -690,6 +690,15 @@ enum ConnectionState<S, T: TimeSource> {
     RecentlyClosed { closed_at_nanos: u64 },
 }
 
+/// Result of `ConnectionStateManager::try_send_nat_traversal` —
+/// distinguishes a slow consumer from a vanished one so the listener
+/// can log them differently.
+enum TrySendNatTraversalOutcome {
+    Sent,
+    Full,
+    Closed,
+}
+
 /// Manages connection state with atomic transitions.
 /// Single source of truth for all connection states per address.
 struct ConnectionStateManager<S, T: TimeSource> {
@@ -779,17 +788,33 @@ impl<S, T: TimeSource> ConnectionStateManager<S, T> {
         }
     }
 
-    /// Try to send a packet to an ongoing NAT traversal.
-    /// Returns Ok(true) if sent, Ok(false) if channel closed.
-    async fn send_nat_traversal(
+    /// Try to send a packet to an ongoing NAT traversal, without blocking.
+    ///
+    /// Returns the outcome distinguishing `Sent` (delivered), `Full`
+    /// (consumer not draining fast enough — usually transient), `Closed`
+    /// (handshake task already exited — state about to be removed).
+    /// Returns `Err(())` if no NAT traversal state exists for `addr`.
+    ///
+    /// Crucially this is non-blocking: the listener task calls this
+    /// synchronously for every inbound packet, so a slow or wedged
+    /// per-handshake consumer cannot stall the listener for other peers.
+    /// Dropped intro packets are recoverable — `connect_outbound_inner`
+    /// retries up to `NAT_TRAVERSAL_MAX_ATTEMPTS` (40 in release builds,
+    /// 10 under `cfg(test)`) at a 200 ms cadence, capped by the 3 s
+    /// `overall_deadline`. So at production settings the remote peer
+    /// fires roughly 15 intro packets during the deadline window — a
+    /// transient channel-full event degrades latency but does not break
+    /// the handshake.
+    fn try_send_nat_traversal(
         &self,
         addr: &SocketAddr,
         packet: PacketData<UnknownEncryption>,
-    ) -> Result<bool, ()> {
+    ) -> Result<TrySendNatTraversalOutcome, ()> {
         if let Some(ConnectionState::NatTraversal { packet_sender, .. }) = self.states.get(addr) {
-            match packet_sender.send(packet).await {
-                Ok(()) => Ok(true),
-                Err(_) => Ok(false),
+            match packet_sender.try_send(packet) {
+                Ok(()) => Ok(TrySendNatTraversalOutcome::Sent),
+                Err(mpsc::error::TrySendError::Full(_)) => Ok(TrySendNatTraversalOutcome::Full),
+                Err(mpsc::error::TrySendError::Closed(_)) => Ok(TrySendNatTraversalOutcome::Closed),
             }
         } else {
             Err(())
@@ -1368,10 +1393,21 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                             }
                                             self.connections.record_asym_attempt(remote_addr);
                                         }
-                                        if let Err(()) = self.connections.send_nat_traversal(&remote_addr, packet_data).await {
-                                            tracing::debug!(peer_addr = %remote_addr, "failed to send NAT traversal packet");
+                                        match self.connections.try_send_nat_traversal(&remote_addr, packet_data) {
+                                            Ok(TrySendNatTraversalOutcome::Sent) => continue,
+                                            Ok(TrySendNatTraversalOutcome::Full) => {
+                                                tracing::debug!(peer_addr = %remote_addr, "NAT traversal channel full, dropping packet (peer will retry)");
+                                                continue;
+                                            }
+                                            Ok(TrySendNatTraversalOutcome::Closed) => {
+                                                tracing::debug!(peer_addr = %remote_addr, "NAT traversal handshake task exited; dropping packet");
+                                                continue;
+                                            }
+                                            Err(()) => {
+                                                tracing::debug!(peer_addr = %remote_addr, "NAT traversal state missing");
+                                                continue;
+                                            }
                                         }
-                                        continue;
                                     }
 
                                     ConnectionState::RecentlyClosed { .. } => {
@@ -3061,6 +3097,65 @@ mod version_cmp {
         assert!(
             elapsed < BUDGET,
             "{ATTEMPTS} try_send_gateway_handshake calls took {elapsed:?} (budget {BUDGET:?})"
+        );
+        assert!(
+            full_count >= ATTEMPTS - CAPACITY,
+            "Expected at least {} Full results, got {full_count}",
+            ATTEMPTS - CAPACITY
+        );
+    }
+
+    /// Regression for #3961 — completes the trio of listener-forwarding
+    /// non-blocking tests with the NAT-traversal path. Like `try_send_established`
+    /// and `try_send_gateway_handshake`, `try_send_nat_traversal` is invoked
+    /// synchronously from `UdpPacketsListener::listen` for every inbound
+    /// packet that maps to an in-flight NAT-traversal handshake. The prior
+    /// implementation (`send_nat_traversal` with `.send().await`) could
+    /// stall the listener for every other peer if a single per-handshake
+    /// consumer was slow. This test pins the new non-blocking contract.
+    #[tokio::test]
+    async fn test_try_send_nat_traversal_never_blocks_when_full() {
+        use super::ConnectionStateManager;
+        use super::mock_transport::MockSocket;
+        use crate::simulation::VirtualTime;
+        use crate::transport::packet_data::{PacketData, UnknownEncryption};
+        use std::net::SocketAddr;
+        use std::time::{Duration, Instant};
+        use tokio::sync::{mpsc, oneshot};
+
+        const CAPACITY: usize = 4;
+        const ATTEMPTS: usize = 1_000;
+        const BUDGET: Duration = Duration::from_secs(1);
+
+        let time = VirtualTime::new();
+        let mut manager: ConnectionStateManager<MockSocket, VirtualTime> =
+            ConnectionStateManager::new(time);
+        let addr: SocketAddr = "127.0.0.1:8004".parse().unwrap();
+
+        let (tx, _rx) = mpsc::channel::<PacketData<UnknownEncryption>>(CAPACITY);
+        let (result_tx, _result_rx) = oneshot::channel();
+        let started = manager.start_nat_traversal(addr, tx, result_tx);
+        assert!(started, "Should start NAT traversal");
+
+        let make_packet = || PacketData::<UnknownEncryption>::from_buf([0u8; 32]);
+
+        let started_at = Instant::now();
+        let mut full_count = 0;
+        for _ in 0..ATTEMPTS {
+            match manager.try_send_nat_traversal(&addr, make_packet()) {
+                Ok(super::TrySendNatTraversalOutcome::Sent) => {}
+                Ok(super::TrySendNatTraversalOutcome::Full) => full_count += 1,
+                Ok(super::TrySendNatTraversalOutcome::Closed) => {
+                    panic!("receiver still alive; should not be Closed");
+                }
+                Err(()) => panic!("NAT traversal state unexpectedly missing"),
+            }
+        }
+        let elapsed = started_at.elapsed();
+
+        assert!(
+            elapsed < BUDGET,
+            "{ATTEMPTS} try_send_nat_traversal calls took {elapsed:?} (budget {BUDGET:?})"
         );
         assert!(
             full_count >= ATTEMPTS - CAPACITY,
